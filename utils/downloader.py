@@ -190,17 +190,6 @@ def _make_session_dir() -> str:
     return path
 
 
-YOUTUBE_EXTRACTOR_ARGS = {
-    "youtube": {
-        "player_client": ["ios", "android", "mweb"],
-    }
-}
-DEFAULT_USER_AGENT = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-)
-
-
 def _base_ydl_opts(out_dir: str) -> dict:
     opts = {
         "outtmpl": os.path.join(out_dir, "%(title).60s.%(ext)s"),
@@ -212,10 +201,10 @@ def _base_ydl_opts(out_dir: str) -> dict:
         "concurrent_fragment_downloads": 4,
         "fragment_retries": 3,
         "fragment_timeout": 15,
-        "extractor_args": YOUTUBE_EXTRACTOR_ARGS,
-        "http_headers": {
-            "User-Agent": DEFAULT_USER_AGENT,
-            "Accept-Language": "en-US,en;q=0.9",
+        "extractor_args": {
+            "youtube": {
+                "player_client": ["android", "web"],
+            }
         },
     }
     ffmpeg_dir = str(Path(FFMPEG_PATH).parent)
@@ -225,30 +214,36 @@ def _base_ydl_opts(out_dir: str) -> dict:
 
 
 def _get_info(url: str) -> Optional[dict]:
-    """Fetch video metadata without downloading."""
-    opts = {
-        "quiet": True,
-        "no_warnings": True,
-        "skip_download": True,
-        "noplaylist": True,
-        "socket_timeout": 30,
-        "extractor_args": YOUTUBE_EXTRACTOR_ARGS,
-        "http_headers": {
-            "User-Agent": DEFAULT_USER_AGENT,
-            "Accept-Language": "en-US,en;q=0.9",
-        },
-    }
-    try:
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            return ydl.extract_info(url, download=False)
-    except Exception as e:
-        logger.warning("Primary info extraction failed for %s (%s), trying fallback...", url, e)
+    """Fetch video metadata without downloading, trying android client first."""
+    client_candidates = [
+        ["android"],
+        ["android", "web"],
+        None,  # default
+    ]
+
+    for clients in client_candidates:
+        opts = {
+            "quiet": True,
+            "no_warnings": True,
+            "skip_download": True,
+            "noplaylist": True,
+            "socket_timeout": 30,
+        }
+        if clients and ("youtube.com" in url or "youtu.be" in url):
+            opts["extractor_args"] = {
+                "youtube": {
+                    "player_client": clients,
+                }
+            }
         try:
-            with yt_dlp.YoutubeDL({"quiet": True, "skip_download": True, "noplaylist": True}) as fallback_ydl:
-                return fallback_ydl.extract_info(url, download=False)
-        except Exception as e2:
-            logger.error("All info extraction attempts failed for %s: %s", url, e2)
-            return None
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                info = ydl.extract_info(url, download=False)
+                if info:
+                    return info
+        except Exception as e:
+            logger.warning("Info extraction failed with clients %s for %s: %s", clients, url, e)
+
+    return None
 
 
 def _download_file(url: str, ydl_opts: dict, progress_state: Optional[dict] = None) -> Optional[str]:
