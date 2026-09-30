@@ -55,14 +55,34 @@ def start_health_server():
         logger.warning(f"Health server error on port {port}: {e}")
 
 
+def self_ping_worker():
+    """Periodically ping RENDER_EXTERNAL_URL every 10 minutes to keep Render awake."""
+    import time
+    import urllib.request
+    url = os.getenv("RENDER_EXTERNAL_URL")
+    if not url:
+        return
+    logger.info(f"🔄 Self-ping keep-alive worker started for {url}")
+    while True:
+        time.sleep(10 * 60)  # 10 minutes
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "RenderSelfPing/1.0"})
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                pass
+            logger.info("Keep-alive self-ping sent to %s", url)
+        except Exception as e:
+            logger.warning("Keep-alive self-ping failed: %s", e)
+
+
 def main() -> None:
     token = os.getenv("BOT_TOKEN")
     if not token or token == "your_telegram_bot_token_here":
         logger.error("❌ BOT_TOKEN not set! Please create a .env file with your bot token.")
         raise SystemExit(1)
 
-    # Start health server for Render
+    # Start health server and keep-alive ping for Render
     threading.Thread(target=start_health_server, daemon=True).start()
+    threading.Thread(target=self_ping_worker, daemon=True).start()
 
     # Initialize SQLite database
     init_db()
