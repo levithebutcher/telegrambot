@@ -29,6 +29,8 @@ from utils.downloader import (
     get_session_thumbnail,
     get_video_metadata_and_thumb,
     download_carousel_media,
+    download_photo,
+    resolve_short_url,
     compress_video_to_size,
     split_video_by_size,
     MAX_FILE_SIZE_MB,
@@ -177,7 +179,7 @@ async def url_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
 
     urls = extract_urls(text)
-    url = urls[0]
+    url = resolve_short_url(urls[0])
 
     # Check if user sent inline trim time with the URL (e.g. "https://... 00:10-00:30")
     if time_range:
@@ -217,6 +219,11 @@ async def url_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     # ── Instagram Carousel / Multi-item Albums ──
     if info.get("is_carousel"):
         await _execute_carousel_download(update, context, url, info, thinking_msg)
+        return
+
+    # ── Single Photo (Pinterest Image, Instagram Photo, etc.) ──
+    if info.get("is_photo"):
+        await _execute_photo_download(update, context, url, info, thinking_msg)
         return
 
     context.user_data["pending_info"] = info
@@ -311,6 +318,71 @@ async def _send_video_message(
                 thumb_file.close()
             except Exception:
                 pass
+
+
+# ── 🖼️ Single Photo Download (Pinterest, Instagram Photo, etc.) ────────────
+
+async def _execute_photo_download(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    url: str,
+    info: dict,
+    msg,
+) -> None:
+    """Downloads a photo and sends it to Telegram with original HD quality."""
+    chat_id = update.effective_chat.id
+    platform = info.get("platform", "Photo").capitalize()
+    emoji = info.get("emoji", "📌")
+    await msg.edit_text(
+        f"{emoji} <b>Downloading {platform} image in full HD...</b>\n\n⏳ Please wait...",
+        parse_mode="HTML",
+    )
+    await context.bot.send_chat_action(chat_id, ChatAction.UPLOAD_PHOTO)
+
+    photo_url = info.get("photo_url")
+    loop = asyncio.get_event_loop()
+    file_path = await loop.run_in_executor(None, download_photo, photo_url)
+
+    if not file_path or not os.path.isfile(file_path):
+        await msg.edit_text(
+            "❌ <b>Could not download image.</b> Media might be private or unavailable.",
+            parse_mode="HTML",
+        )
+        return
+
+    size = file_size_mb(file_path)
+    title = truncate(info.get("title", f"{platform} Image"), 60)
+    uploader = truncate(info.get("uploader", "Pinterest"), 40)
+    caption = (
+        f"{emoji} {platform}\n"
+        f"📌 {title}\n"
+        f"📦 {size:.2f} MB\n\n"
+        f"🤖 @butcherbombit_bot"
+    )
+
+    try:
+        with open(file_path, "rb") as f:
+            await context.bot.send_photo(
+                chat_id=chat_id,
+                photo=f,
+                caption=caption,
+                read_timeout=120,
+                write_timeout=120,
+            )
+        increment_download_count(update.effective_user.id)
+        try:
+            await msg.delete()
+        except TelegramError:
+            pass
+    except Exception as e:
+        logger.error("Failed to send photo: %s", e)
+        await context.bot.send_message(
+            chat_id,
+            f"❌ <b>Failed to send image:</b>\n<code>{_h(str(e))}</code>",
+            parse_mode="HTML",
+        )
+    finally:
+        cleanup_session(file_path)
 
 
 # ── 📸 Instagram Carousel & Multi-Item Album Download ───────────────────────

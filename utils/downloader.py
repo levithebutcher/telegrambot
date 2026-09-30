@@ -38,7 +38,7 @@ PLATFORM_PATTERNS = {
     "facebook":    re.compile(r"(facebook\.com|fb\.watch)", re.I),
     "reddit":      re.compile(r"reddit\.com", re.I),
     "soundcloud":  re.compile(r"soundcloud\.com", re.I),
-    "pinterest":   re.compile(r"pinterest\.(com|co\.uk|ca|de|fr)", re.I),
+    "pinterest":   re.compile(r"(pinterest\.[a-z.]+|pin\.it)", re.I),
     "vimeo":       re.compile(r"vimeo\.com", re.I),
     "dailymotion": re.compile(r"dailymotion\.com", re.I),
     "twitch":      re.compile(r"twitch\.tv", re.I),
@@ -65,6 +65,138 @@ URL_REGEX = re.compile(
     r"https?://[^\s/$.?#].[^\s]*",
     re.I,
 )
+
+
+def resolve_short_url(url: str) -> str:
+    """Follow redirects for short URLs like pin.it, bit.ly, etc."""
+    u = url.lower()
+    if "pin.it" in u or "t.co" in u or "bit.ly" in u:
+        try:
+            import urllib.request
+            req = urllib.request.Request(
+                url,
+                headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"},
+            )
+            with urllib.request.urlopen(req, timeout=12) as resp:
+                return resp.geturl()
+        except Exception as e:
+            logger.warning("Could not resolve short url %s: %s", url, e)
+    return url
+
+
+def _download_direct_file(url: str, output_path: str) -> bool:
+    """Download a direct CDN media file using urllib with browser headers."""
+    try:
+        import urllib.request
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Accept": "*/*",
+        }
+        req = urllib.request.Request(url, headers=headers)
+        with urllib.request.urlopen(req, timeout=40) as resp:
+            with open(output_path, "wb") as f:
+                while chunk := resp.read(65536):
+                    f.write(chunk)
+        return os.path.isfile(output_path) and os.path.getsize(output_path) > 100
+    except Exception as e:
+        logger.warning("Direct download failed for %s: %s", url[:60], e)
+        return False
+
+
+def extract_pinterest_pin_fallback(url: str) -> Optional[dict]:
+    """Fallback scraper for Pinterest image pins when yt-dlp doesn't extract formats."""
+    try:
+        import urllib.request
+        resolved = resolve_short_url(url)
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        }
+        req = urllib.request.Request(resolved, headers=headers)
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            html = resp.read().decode("utf-8", errors="ignore")
+
+        # Find og:image
+        m_img = re.search(r'<meta\s+property=["\']og:image["\']\s+content=["\']([^"\']+)["\']', html)
+        if not m_img:
+            m_img = re.search(r'<meta\s+content=["\']([^"\']+)["\']\s+property=["\']og:image["\']', html)
+        if not m_img:
+            return None
+
+        img_url = m_img.group(1)
+        orig_img_url = re.sub(r"/(?:736x|564x|474x|236x)/", "/originals/", img_url)
+
+        m_title = re.search(r'<meta\s+property=["\']og:title["\']\s+content=["\']([^"\']+)["\']', html)
+        title = m_title.group(1) if m_title else "Pinterest Image"
+
+        return {
+            "title": title,
+            "uploader": "Pinterest",
+            "url": resolved,
+            "is_photo": True,
+            "photo_url": orig_img_url,
+            "platform": "pinterest",
+            "emoji": "📌",
+            "formats": [],
+            "thumbnails": [{"url": orig_img_url}],
+        }
+    except Exception as e:
+        logger.warning("Pinterest fallback extraction error for %s: %s", url, e)
+        return None
+
+
+def get_best_photo_url(info: dict) -> Optional[str]:
+    """Finds highest-resolution direct image URL from info dict (supporting Pinterest, Instagram, etc.)."""
+    if info.get("photo_url"):
+        return info["photo_url"]
+
+    thumbs = info.get("thumbnails") or []
+    # 1. Look for Pinterest /originals/ URL
+    for t in thumbs:
+        u = t.get("url", "")
+        if "/originals/" in u:
+            return u
+
+    # 2. Find largest resolution thumbnail
+    if thumbs:
+        best_t = max(thumbs, key=lambda t: (t.get("width") or 0) * (t.get("height") or 0))
+        u = best_t.get("url")
+        if u:
+            if "pinimg.com" in u:
+                u = re.sub(r"/(?:736x|564x|474x|236x)/", "/originals/", u)
+            return u
+
+    # 3. Fallback to info.get("thumbnail") or info.get("url")
+    u = info.get("thumbnail") or info.get("url")
+    if u:
+        if "pinimg.com" in u:
+            u = re.sub(r"/(?:736x|564x|474x|236x)/", "/originals/", u)
+        return u
+
+    return None
+
+
+def download_photo(photo_url: str) -> Optional[str]:
+    """Downloads a photo to a session directory and ensures it is a clean JPEG."""
+    out_dir = _make_session_dir()
+    file_id = uuid.uuid4().hex[:8]
+    target_path = os.path.join(out_dir, f"photo_{file_id}.jpg")
+
+    success = _download_direct_file(photo_url, target_path)
+    if not success and "/originals/" in photo_url:
+        # Fallback to 736x if originals is not found
+        fallback_url = photo_url.replace("/originals/", "/736x/")
+        success = _download_direct_file(fallback_url, target_path)
+
+    if success and os.path.isfile(target_path):
+        try:
+            with Image.open(target_path) as im:
+                if im.format not in ("JPEG", "JPG"):
+                    im.convert("RGB").save(target_path, "JPEG", quality=95)
+        except Exception:
+            pass
+        return target_path
+    return None
 
 
 def detect_platform(url: str) -> str:
@@ -352,6 +484,7 @@ def _base_ydl_opts(out_dir: str) -> dict:
 
 def _get_info(url: str) -> Optional[dict]:
     """Fetch video metadata without downloading, trying android client first without cookies."""
+    url = resolve_short_url(url)
     cookie_path = get_cookie_file_path()
 
     # Step 1: Try Android client for YouTube (works without cookies, bypasses cloud blocks)
@@ -391,12 +524,12 @@ def _get_info(url: str) -> Optional[dict]:
         try:
             with yt_dlp.YoutubeDL(cookie_opts) as ydl:
                 info = ydl.extract_info(url, download=False)
-                if info and (info.get("formats") or info.get("title") or info.get("entries")):
+                if info and (info.get("formats") or info.get("title") or info.get("entries") or info.get("thumbnails")):
                     return info
         except Exception as e:
             logger.warning("Cookie extraction failed for %s: %s", url, e)
 
-    # Step 3: Default extraction (for Instagram, Twitter/X, TikTok, Reddit, etc.)
+    # Step 3: Default extraction (for Instagram, Twitter/X, TikTok, Reddit, Pinterest, etc.)
     default_opts = {
         "quiet": True,
         "no_warnings": True,
@@ -406,9 +539,17 @@ def _get_info(url: str) -> Optional[dict]:
     }
     try:
         with yt_dlp.YoutubeDL(default_opts) as ydl:
-            return ydl.extract_info(url, download=False)
+            info = ydl.extract_info(url, download=False)
+            if info:
+                return info
     except Exception as e:
-        logger.error("Default info extraction failed for %s: %s", url, e)
+        logger.warning("Default info extraction failed for %s: %s", url, e)
+
+    # Step 4: Fallback scraper for Pinterest image pins
+    if "pinterest." in url.lower() or "pin.it" in url.lower():
+        fallback_info = extract_pinterest_pin_fallback(url)
+        if fallback_info:
+            return fallback_info
 
     return None
 
@@ -514,10 +655,15 @@ async def get_media_info(url: str) -> Optional[dict]:
     is_carousel = len(entries) > 1
     carousel_count = len(entries) if is_carousel else 0
 
+    photo_url = get_best_photo_url(info)
+    is_photo = (len(video_qualities) == 0 and photo_url is not None) or bool(info.get("is_photo"))
+
     title = info.get("title") or "Unknown Title"
     if is_carousel:
         duration_str = f"{carousel_count} Items"
         title = f"Instagram Album ({carousel_count} items)"
+    elif is_photo:
+        duration_str = "Photo"
 
     return {
         "title": title[:80],
@@ -531,27 +677,9 @@ async def get_media_info(url: str) -> Optional[dict]:
         "url": url,
         "is_carousel": is_carousel,
         "carousel_count": carousel_count,
+        "is_photo": is_photo,
+        "photo_url": photo_url,
     }
-
-
-def _download_direct_file(url: str, output_path: str) -> bool:
-    """Download a direct CDN media file using urllib with browser headers."""
-    try:
-        import urllib.request
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            "Accept": "*/*",
-            "Referer": "https://www.instagram.com/",
-        }
-        req = urllib.request.Request(url, headers=headers)
-        with urllib.request.urlopen(req, timeout=40) as resp:
-            with open(output_path, "wb") as f:
-                while chunk := resp.read(65536):
-                    f.write(chunk)
-        return os.path.isfile(output_path) and os.path.getsize(output_path) > 100
-    except Exception as e:
-        logger.warning("Direct download failed for %s: %s", url[:60], e)
-        return False
 
 
 def download_carousel_media(url: str) -> Tuple[list[dict], dict]:
