@@ -11,7 +11,7 @@ import json
 import html
 from typing import Optional
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto, InputMediaVideo
 from telegram.ext import ContextTypes
 from telegram.constants import ChatAction
 from telegram.error import TelegramError
@@ -28,6 +28,7 @@ from utils.downloader import (
     trim_media,
     get_session_thumbnail,
     get_video_metadata_and_thumb,
+    download_carousel_media,
     compress_video_to_size,
     split_video_by_size,
     MAX_FILE_SIZE_MB,
@@ -213,6 +214,11 @@ async def url_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         )
         return
 
+    # ── Instagram Carousel / Multi-item Albums ──
+    if info.get("is_carousel"):
+        await _execute_carousel_download(update, context, url, info, thinking_msg)
+        return
+
     context.user_data["pending_info"] = info
 
     emoji   = info["emoji"]
@@ -305,6 +311,122 @@ async def _send_video_message(
                 thumb_file.close()
             except Exception:
                 pass
+
+
+# ── 📸 Instagram Carousel & Multi-Item Album Download ───────────────────────
+
+async def _execute_carousel_download(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    url: str,
+    info: dict,
+    msg,
+) -> None:
+    """Downloads all slides/items from an Instagram Carousel or Stories collection and sends as an album."""
+    chat_id = update.effective_chat.id
+    count = info.get("carousel_count", 0)
+    count_text = f" ({count} items)" if count > 0 else ""
+    await msg.edit_text(
+        f"📸 <b>Instagram Carousel detected{count_text}!</b>\n\n"
+        "⏳ Downloading all photos and videos...",
+        parse_mode="HTML",
+    )
+    await context.bot.send_chat_action(chat_id, ChatAction.UPLOAD_PHOTO)
+
+    loop = asyncio.get_event_loop()
+    items, raw_info = await loop.run_in_executor(None, download_carousel_media, url)
+
+    if not items:
+        await msg.edit_text(
+            "❌ <b>Could not download carousel items.</b>\n"
+            "Media might be private, deleted, or require login.",
+            parse_mode="HTML",
+        )
+        return
+
+    await msg.edit_text(
+        f"📤 <b>Uploading {len(items)} items to Telegram as Media Album...</b>",
+        parse_mode="HTML",
+    )
+    await context.bot.send_chat_action(chat_id, ChatAction.UPLOAD_PHOTO)
+
+    title = truncate(info.get("title", "Instagram Post"), 60)
+    uploader = truncate(info.get("uploader", "Instagram User"), 40)
+    caption = (
+        f"📸 Instagram ({len(items)} items)\n"
+        f"📌 {title}\n"
+        f"👤 {uploader}\n\n"
+        f"🤖 @butcherbombit_bot"
+    )
+
+    try:
+        if len(items) == 1:
+            it = items[0]
+            if it["type"] == "photo":
+                with open(it["path"], "rb") as f:
+                    await context.bot.send_photo(chat_id, photo=f, caption=caption)
+            else:
+                await _send_video_message(context.bot, chat_id, it["path"], caption)
+        else:
+            # Telegram allows maximum 10 media items per send_media_group
+            batches = [items[i:i + 10] for i in range(0, len(items), 10)]
+            for b_idx, batch in enumerate(batches):
+                media_group = []
+                opened_files = []
+                for idx, it in enumerate(batch):
+                    is_first = (b_idx == 0 and idx == 0)
+                    item_caption = caption if is_first else None
+                    if it["type"] == "photo":
+                        f = open(it["path"], "rb")
+                        opened_files.append(f)
+                        media_group.append(InputMediaPhoto(media=f, caption=item_caption))
+                    else:
+                        f = open(it["path"], "rb")
+                        opened_files.append(f)
+                        thumb_f = None
+                        if it.get("thumbnail_path") and os.path.isfile(it["thumbnail_path"]):
+                            thumb_f = open(it["thumbnail_path"], "rb")
+                            opened_files.append(thumb_f)
+                        media_group.append(
+                            InputMediaVideo(
+                                media=f,
+                                caption=item_caption,
+                                width=it.get("width"),
+                                height=it.get("height"),
+                                duration=it.get("duration"),
+                                thumbnail=thumb_f,
+                                supports_streaming=True,
+                            )
+                        )
+                try:
+                    await context.bot.send_media_group(
+                        chat_id=chat_id,
+                        media=media_group,
+                        read_timeout=180,
+                        write_timeout=180,
+                    )
+                finally:
+                    for f in opened_files:
+                        try:
+                            f.close()
+                        except Exception:
+                            pass
+
+        increment_download_count(update.effective_user.id)
+        try:
+            await msg.delete()
+        except TelegramError:
+            pass
+    except Exception as e:
+        logger.error("Failed to send carousel media group: %s", e)
+        await context.bot.send_message(
+            chat_id,
+            f"❌ <b>Failed to send album:</b>\n<code>{_h(str(e))}</code>",
+            parse_mode="HTML",
+        )
+    finally:
+        if items and "path" in items[0]:
+            cleanup_session(items[0]["path"])
 
 
 # ── ⚡ Fast Reel / Short Download ───────────────────────────────────────────

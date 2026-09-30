@@ -376,20 +376,22 @@ def _get_info(url: str) -> Optional[dict]:
         except Exception as e:
             logger.warning("Android client extraction failed for %s: %s", url, e)
 
+    is_ig = "instagram.com" in url.lower()
+
     # Step 2: Try with cookies (if provided) on web/mweb
     if cookie_path:
         cookie_opts = {
             "quiet": True,
             "no_warnings": True,
             "skip_download": True,
-            "noplaylist": True,
+            "noplaylist": not is_ig,
             "socket_timeout": 30,
             "cookiefile": cookie_path,
         }
         try:
             with yt_dlp.YoutubeDL(cookie_opts) as ydl:
                 info = ydl.extract_info(url, download=False)
-                if info and (info.get("formats") or info.get("title")):
+                if info and (info.get("formats") or info.get("title") or info.get("entries")):
                     return info
         except Exception as e:
             logger.warning("Cookie extraction failed for %s: %s", url, e)
@@ -399,7 +401,7 @@ def _get_info(url: str) -> Optional[dict]:
         "quiet": True,
         "no_warnings": True,
         "skip_download": True,
-        "noplaylist": True,
+        "noplaylist": not is_ig,
         "socket_timeout": 30,
     }
     try:
@@ -508,8 +510,17 @@ async def get_media_info(url: str) -> Optional[dict]:
         for f in formats
     )
 
+    entries = [e for e in info.get("entries", []) if e] if info.get("entries") else []
+    is_carousel = len(entries) > 1
+    carousel_count = len(entries) if is_carousel else 0
+
+    title = info.get("title") or "Unknown Title"
+    if is_carousel:
+        duration_str = f"{carousel_count} Items"
+        title = f"Instagram Album ({carousel_count} items)"
+
     return {
-        "title": info.get("title", "Unknown Title")[:80],
+        "title": title[:80],
         "uploader": info.get("uploader") or info.get("channel") or "Unknown",
         "duration": duration_str,
         "platform": platform,
@@ -518,7 +529,126 @@ async def get_media_info(url: str) -> Optional[dict]:
         "has_audio": has_audio or platform == "soundcloud",
         "thumbnail": info.get("thumbnail"),
         "url": url,
+        "is_carousel": is_carousel,
+        "carousel_count": carousel_count,
     }
+
+
+def _download_direct_file(url: str, output_path: str) -> bool:
+    """Download a direct CDN media file using urllib with browser headers."""
+    try:
+        import urllib.request
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Accept": "*/*",
+            "Referer": "https://www.instagram.com/",
+        }
+        req = urllib.request.Request(url, headers=headers)
+        with urllib.request.urlopen(req, timeout=40) as resp:
+            with open(output_path, "wb") as f:
+                while chunk := resp.read(65536):
+                    f.write(chunk)
+        return os.path.isfile(output_path) and os.path.getsize(output_path) > 100
+    except Exception as e:
+        logger.warning("Direct download failed for %s: %s", url[:60], e)
+        return False
+
+
+def download_carousel_media(url: str) -> Tuple[list[dict], dict]:
+    """
+    Downloads all slides/items from an Instagram carousel or multi-item story.
+    Returns (items, post_info)
+    """
+    out_dir = _make_session_dir()
+    cookie_path = get_cookie_file_path()
+
+    opts = {
+        "quiet": True,
+        "no_warnings": True,
+        "skip_download": True,
+        "noplaylist": False,
+        "socket_timeout": 30,
+    }
+    if cookie_path:
+        opts["cookiefile"] = cookie_path
+
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+    except Exception as e:
+        logger.error("Failed to extract carousel info for %s: %s", url, e)
+        return [], {}
+
+    if not info:
+        return [], {}
+
+    entries = [e for e in info.get("entries", []) if e] if info.get("entries") else [info]
+    items: list[dict] = []
+
+    for idx, entry in enumerate(entries):
+        slide_num = idx + 1
+        formats = entry.get("formats") or []
+        video_formats = [
+            f for f in formats
+            if f.get("vcodec") != "none" or (f.get("ext") == "mp4" and f.get("acodec") != "none")
+        ]
+
+        if video_formats:
+            target_path = os.path.join(out_dir, f"slide_{slide_num:02d}.mp4")
+            best_fmt = max(
+                video_formats,
+                key=lambda f: (f.get("height") or 0) * (f.get("width") or 0) or (f.get("tbr") or 0),
+            )
+            video_url = best_fmt.get("url")
+
+            downloaded = False
+            if video_url:
+                downloaded = _download_direct_file(video_url, target_path)
+
+            if not downloaded:
+                entry_opts = _base_ydl_opts(out_dir)
+                entry_opts["outtmpl"] = target_path
+                entry_opts["format"] = "bestvideo+bestaudio/best"
+                try:
+                    with yt_dlp.YoutubeDL(entry_opts) as ydl_single:
+                        ydl_single.download([entry.get("webpage_url") or entry.get("url") or url])
+                    if os.path.isfile(target_path) and os.path.getsize(target_path) > 100:
+                        downloaded = True
+                except Exception as e:
+                    logger.warning("Fallback download failed for slide %d: %s", slide_num, e)
+
+            if os.path.isfile(target_path) and os.path.getsize(target_path) > 100:
+                meta = get_video_metadata_and_thumb(target_path)
+                items.append({
+                    "type": "video",
+                    "path": target_path,
+                    "width": meta.get("width") or best_fmt.get("width"),
+                    "height": meta.get("height") or best_fmt.get("height"),
+                    "duration": meta.get("duration") or int(entry.get("duration") or 0),
+                    "thumbnail_path": meta.get("thumbnail_path"),
+                })
+        else:
+            target_path = os.path.join(out_dir, f"slide_{slide_num:02d}.jpg")
+            thumbs = entry.get("thumbnails") or []
+            if thumbs:
+                best_img = max(thumbs, key=lambda t: (t.get("width") or 0) * (t.get("height") or 0))
+                img_url = best_img.get("url")
+            else:
+                img_url = entry.get("url")
+
+            if img_url and _download_direct_file(img_url, target_path):
+                try:
+                    with Image.open(target_path) as im:
+                        if im.format not in ("JPEG", "JPG"):
+                            im.convert("RGB").save(target_path, "JPEG", quality=95)
+                except Exception:
+                    pass
+                items.append({
+                    "type": "photo",
+                    "path": target_path,
+                })
+
+    return items, info
 
 
 async def download_video(
