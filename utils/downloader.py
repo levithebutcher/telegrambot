@@ -233,13 +233,10 @@ def _base_ydl_opts(out_dir: str) -> dict:
         "fragment_timeout": 15,
         "extractor_args": {
             "youtube": {
-                "player_client": ["android", "web"],
+                "player_client": ["android"],
             }
         },
     }
-    cookie_path = get_cookie_file_path()
-    if cookie_path:
-        opts["cookiefile"] = cookie_path
 
     ffmpeg_dir = str(Path(FFMPEG_PATH).parent)
     if os.path.isfile(FFMPEG_PATH):
@@ -248,39 +245,62 @@ def _base_ydl_opts(out_dir: str) -> dict:
 
 
 def _get_info(url: str) -> Optional[dict]:
-    """Fetch video metadata without downloading, trying cookies and client candidates."""
+    """Fetch video metadata without downloading, trying android client first without cookies."""
     cookie_path = get_cookie_file_path()
 
-    client_candidates = [
-        ["android"],
-        ["android", "web"],
-        None,  # default
-    ]
-
-    for clients in client_candidates:
-        opts = {
+    # Step 1: Try Android client for YouTube (works without cookies, bypasses cloud blocks)
+    if "youtube.com" in url or "youtu.be" in url:
+        android_opts = {
             "quiet": True,
             "no_warnings": True,
             "skip_download": True,
             "noplaylist": True,
             "socket_timeout": 30,
-        }
-        if cookie_path:
-            opts["cookiefile"] = cookie_path
-
-        if clients and ("youtube.com" in url or "youtu.be" in url):
-            opts["extractor_args"] = {
+            "extractor_args": {
                 "youtube": {
-                    "player_client": clients,
+                    "player_client": ["android"],
                 }
-            }
+            },
+        }
         try:
-            with yt_dlp.YoutubeDL(opts) as ydl:
+            with yt_dlp.YoutubeDL(android_opts) as ydl:
                 info = ydl.extract_info(url, download=False)
-                if info:
+                if info and (info.get("formats") or info.get("title")):
                     return info
         except Exception as e:
-            logger.warning("Info extraction failed with clients %s for %s: %s", clients, url, e)
+            logger.warning("Android client extraction failed for %s: %s", url, e)
+
+    # Step 2: Try with cookies (if provided) on web/mweb
+    if cookie_path:
+        cookie_opts = {
+            "quiet": True,
+            "no_warnings": True,
+            "skip_download": True,
+            "noplaylist": True,
+            "socket_timeout": 30,
+            "cookiefile": cookie_path,
+        }
+        try:
+            with yt_dlp.YoutubeDL(cookie_opts) as ydl:
+                info = ydl.extract_info(url, download=False)
+                if info and (info.get("formats") or info.get("title")):
+                    return info
+        except Exception as e:
+            logger.warning("Cookie extraction failed for %s: %s", url, e)
+
+    # Step 3: Default extraction (for Instagram, Twitter/X, TikTok, Reddit, etc.)
+    default_opts = {
+        "quiet": True,
+        "no_warnings": True,
+        "skip_download": True,
+        "noplaylist": True,
+        "socket_timeout": 30,
+    }
+    try:
+        with yt_dlp.YoutubeDL(default_opts) as ydl:
+            return ydl.extract_info(url, download=False)
+    except Exception as e:
+        logger.error("Default info extraction failed for %s: %s", url, e)
 
     return None
 
