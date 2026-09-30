@@ -11,9 +11,11 @@ import logging
 import re
 import uuid
 import subprocess
+import html
 from pathlib import Path
 from typing import Optional, Tuple
 
+import requests
 import yt_dlp
 from PIL import Image
 
@@ -70,34 +72,43 @@ URL_REGEX = re.compile(
 def resolve_short_url(url: str) -> str:
     """Follow redirects for short URLs like pin.it, bit.ly, etc."""
     u = url.lower()
-    if "pin.it" in u or "t.co" in u or "bit.ly" in u:
+    if any(k in u for k in ("pin.it", "t.co", "bit.ly", "tinyurl", "fb.watch")):
         try:
-            import urllib.request
-            req = urllib.request.Request(
-                url,
-                headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"},
-            )
-            with urllib.request.urlopen(req, timeout=12) as resp:
-                return resp.geturl()
+            headers = {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            }
+            r = requests.get(url, headers=headers, allow_redirects=True, timeout=12)
+            if r.url:
+                return r.url
         except Exception as e:
             logger.warning("Could not resolve short url %s: %s", url, e)
     return url
 
 
-def _download_direct_file(url: str, output_path: str) -> bool:
-    """Download a direct CDN media file using urllib with browser headers."""
+def _download_direct_file(url: str, output_path: str, referer: Optional[str] = None) -> bool:
+    """Download a direct CDN media file using requests with browser headers."""
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "Accept": "*/*",
+    }
+    if referer:
+        headers["Referer"] = referer
+    elif "instagram.com" in url or "cdninstagram.com" in url:
+        headers["Referer"] = "https://www.instagram.com/"
+    elif "pinimg.com" in url or "pinterest." in url:
+        headers["Referer"] = "https://www.pinterest.com/"
+
     try:
-        import urllib.request
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            "Accept": "*/*",
-        }
-        req = urllib.request.Request(url, headers=headers)
-        with urllib.request.urlopen(req, timeout=40) as resp:
+        r = requests.get(url, headers=headers, stream=True, timeout=40)
+        if r.status_code == 200:
             with open(output_path, "wb") as f:
-                while chunk := resp.read(65536):
-                    f.write(chunk)
-        return os.path.isfile(output_path) and os.path.getsize(output_path) > 100
+                for chunk in r.iter_content(chunk_size=65536):
+                    if chunk:
+                        f.write(chunk)
+            return os.path.isfile(output_path) and os.path.getsize(output_path) > 100
+        logger.warning("Direct download HTTP %s for %s", r.status_code, url[:60])
+        return False
     except Exception as e:
         logger.warning("Direct download failed for %s: %s", url[:60], e)
         return False
@@ -106,28 +117,48 @@ def _download_direct_file(url: str, output_path: str) -> bool:
 def extract_pinterest_pin_fallback(url: str) -> Optional[dict]:
     """Fallback scraper for Pinterest image pins when yt-dlp doesn't extract formats."""
     try:
-        import urllib.request
         resolved = resolve_short_url(url)
         headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
         }
-        req = urllib.request.Request(resolved, headers=headers)
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            html = resp.read().decode("utf-8", errors="ignore")
+        resp = requests.get(resolved, headers=headers, allow_redirects=True, timeout=15)
+        html_text = resp.text
 
-        # Find og:image
-        m_img = re.search(r'<meta\s+property=["\']og:image["\']\s+content=["\']([^"\']+)["\']', html)
+        # 1. Title
+        title = "Pinterest Image"
+        m_title = re.search(r'<meta[^>]+(?:property|name)=["\']og:title["\'][^>]+content=["\']([^"\']+)["\']', html_text, re.I)
+        if not m_title:
+            m_title = re.search(r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+(?:property|name)=["\']og:title["\']', html_text, re.I)
+        if not m_title:
+            m_title = re.search(r'<title>([^<]+)</title>', html_text, re.I)
+        if m_title:
+            title = html.unescape(m_title.group(1)).strip()
+
+        # 2. Image URL
+        orig_img_url = None
+        m_img = re.search(r'<meta[^>]+(?:property|name)=["\']og:image["\'][^>]+content=["\']([^"\']+)["\']', html_text, re.I)
         if not m_img:
-            m_img = re.search(r'<meta\s+content=["\']([^"\']+)["\']\s+property=["\']og:image["\']', html)
-        if not m_img:
+            m_img = re.search(r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+(?:property|name)=["\']og:image["\']', html_text, re.I)
+
+        if m_img:
+            raw_url = m_img.group(1)
+            orig_img_url = re.sub(r"/(?:736x|564x|474x|236x)/", "/originals/", raw_url)
+
+        if not orig_img_url:
+            originals = re.findall(r'https://i\.pinimg\.com/originals/[a-zA-Z0-9/_.\-]+(?:\.jpg|\.png|\.webp|\.jpeg)', html_text)
+            real_originals = [u for u in set(originals) if not u.endswith("d53b014d86a6b6761bf649a0ed813c2b.png")]
+            if real_originals:
+                orig_img_url = real_originals[0]
+
+        if not orig_img_url:
+            x736 = re.findall(r'https://i\.pinimg\.com/736x/[a-zA-Z0-9/_.\-]+(?:\.jpg|\.png|\.webp|\.jpeg)', html_text)
+            if x736:
+                orig_img_url = re.sub(r"/736x/", "/originals/", x736[0])
+
+        if not orig_img_url:
             return None
-
-        img_url = m_img.group(1)
-        orig_img_url = re.sub(r"/(?:736x|564x|474x|236x)/", "/originals/", img_url)
-
-        m_title = re.search(r'<meta\s+property=["\']og:title["\']\s+content=["\']([^"\']+)["\']', html)
-        title = m_title.group(1) if m_title else "Pinterest Image"
 
         return {
             "title": title,
@@ -432,20 +463,24 @@ def get_cookie_file_path() -> Optional[str]:
     """
     Checks if cookies are provided via:
     1. A physical file named 'cookies.txt'
-    2. An environment variable 'YOUTUBE_COOKIES' (raw text or base64)
+    2. Environment variables: 'INSTAGRAM_COOKIES', 'YOUTUBE_COOKIES', or 'COOKIES' (raw text or base64)
     Returns path to the cookie file or None.
     """
     if os.path.isfile("cookies.txt") and os.path.getsize("cookies.txt") > 10:
         return "cookies.txt"
 
-    env_cookies = os.getenv("YOUTUBE_COOKIES", "").strip()
+    env_cookies = (
+        os.getenv("INSTAGRAM_COOKIES", "").strip()
+        or os.getenv("YOUTUBE_COOKIES", "").strip()
+        or os.getenv("COOKIES", "").strip()
+    )
     if env_cookies:
         cookie_path = os.path.join(DOWNLOAD_DIR, "session_cookies.txt")
         try:
             import base64
             try:
                 decoded = base64.b64decode(env_cookies).decode("utf-8")
-                if "youtube.com" in decoded or "# Netscape" in decoded:
+                if "instagram.com" in decoded or "youtube.com" in decoded or "# Netscape" in decoded:
                     env_cookies = decoded
             except Exception:
                 pass
@@ -453,7 +488,7 @@ def get_cookie_file_path() -> Optional[str]:
                 f.write(env_cookies)
             return cookie_path
         except Exception as e:
-            logger.warning("Could not write YOUTUBE_COOKIES: %s", e)
+            logger.warning("Could not write session cookies: %s", e)
 
     return None
 
@@ -651,11 +686,22 @@ async def get_media_info(url: str) -> Optional[dict]:
         for f in formats
     )
 
-    entries = [e for e in info.get("entries", []) if e] if info.get("entries") else []
+    raw_entries = info.get("entries")
+    if raw_entries:
+        try:
+            entries = [e for e in raw_entries if e]
+        except Exception:
+            entries = []
+    else:
+        entries = []
+
     is_carousel = len(entries) > 1
     carousel_count = len(entries) if is_carousel else 0
 
     photo_url = get_best_photo_url(info)
+    if not photo_url and len(entries) == 1:
+        photo_url = get_best_photo_url(entries[0])
+
     is_photo = (len(video_qualities) == 0 and photo_url is not None) or bool(info.get("is_photo"))
 
     title = info.get("title") or "Unknown Title"
@@ -710,61 +756,85 @@ def download_carousel_media(url: str) -> Tuple[list[dict], dict]:
     if not info:
         return [], {}
 
-    entries = [e for e in info.get("entries", []) if e] if info.get("entries") else [info]
+    raw_entries = info.get("entries")
+    if raw_entries:
+        try:
+            entries = [e for e in raw_entries if e]
+        except Exception:
+            entries = [info]
+    else:
+        entries = [info]
+
+    # Limit to maximum 10 items to prevent server timeouts and Telegram album limits
+    entries = entries[:10]
     items: list[dict] = []
 
     for idx, entry in enumerate(entries):
+        if not entry:
+            continue
         slide_num = idx + 1
         formats = entry.get("formats") or []
         video_formats = [
             f for f in formats
-            if f.get("vcodec") != "none" or (f.get("ext") == "mp4" and f.get("acodec") != "none")
+            if (f.get("vcodec") and f.get("vcodec") != "none") or (f.get("ext") == "mp4" and f.get("acodec") != "none")
         ]
 
-        if video_formats:
+        is_video = bool(video_formats) or bool(entry.get("duration"))
+
+        if is_video:
             target_path = os.path.join(out_dir, f"slide_{slide_num:02d}.mp4")
-            best_fmt = max(
-                video_formats,
-                key=lambda f: (f.get("height") or 0) * (f.get("width") or 0) or (f.get("tbr") or 0),
-            )
-            video_url = best_fmt.get("url")
-
             downloaded = False
-            if video_url:
-                downloaded = _download_direct_file(video_url, target_path)
 
+            # Check if there is a single MP4 with both video and audio for instant direct download
+            combined_formats = [
+                f for f in video_formats
+                if f.get("vcodec") != "none" and f.get("acodec") != "none" and f.get("url")
+            ]
+            if combined_formats:
+                best_fmt = max(
+                    combined_formats,
+                    key=lambda f: (f.get("height") or 0) * (f.get("width") or 0) or (f.get("tbr") or 0),
+                )
+                downloaded = _download_direct_file(best_fmt["url"], target_path, referer="https://www.instagram.com/")
+
+            # If not direct or DASH streams (separate audio/video), use yt-dlp to download and merge
             if not downloaded:
                 entry_opts = _base_ydl_opts(out_dir)
                 entry_opts["outtmpl"] = target_path
                 entry_opts["format"] = "bestvideo+bestaudio/best"
+                if cookie_path:
+                    entry_opts["cookiefile"] = cookie_path
                 try:
                     with yt_dlp.YoutubeDL(entry_opts) as ydl_single:
-                        ydl_single.download([entry.get("webpage_url") or entry.get("url") or url])
+                        target_url = entry.get("webpage_url") or entry.get("url") or url
+                        ydl_single.download([target_url])
                     if os.path.isfile(target_path) and os.path.getsize(target_path) > 100:
                         downloaded = True
                 except Exception as e:
-                    logger.warning("Fallback download failed for slide %d: %s", slide_num, e)
+                    logger.warning("yt-dlp single download failed for slide %d: %s", slide_num, e)
 
-            if os.path.isfile(target_path) and os.path.getsize(target_path) > 100:
+            if downloaded and os.path.isfile(target_path):
                 meta = get_video_metadata_and_thumb(target_path)
                 items.append({
                     "type": "video",
                     "path": target_path,
-                    "width": meta.get("width") or best_fmt.get("width"),
-                    "height": meta.get("height") or best_fmt.get("height"),
-                    "duration": meta.get("duration") or int(entry.get("duration") or 0),
+                    "width": meta.get("width"),
+                    "height": meta.get("height"),
+                    "duration": meta.get("duration"),
                     "thumbnail_path": meta.get("thumbnail_path"),
                 })
         else:
+            # It's an image slide
             target_path = os.path.join(out_dir, f"slide_{slide_num:02d}.jpg")
             thumbs = entry.get("thumbnails") or []
+            img_url = None
             if thumbs:
                 best_img = max(thumbs, key=lambda t: (t.get("width") or 0) * (t.get("height") or 0))
                 img_url = best_img.get("url")
-            else:
-                img_url = entry.get("url")
+            if not img_url:
+                img_url = entry.get("url") or entry.get("thumbnail")
 
-            if img_url and _download_direct_file(img_url, target_path):
+            if img_url and _download_direct_file(img_url, target_path, referer="https://www.instagram.com/"):
                 try:
                     with Image.open(target_path) as im:
                         if im.format not in ("JPEG", "JPG"):

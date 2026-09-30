@@ -179,6 +179,17 @@ async def url_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
 
     urls = extract_urls(text)
+    if not urls:
+        await update.message.reply_text(
+            "⚠️ Please send a valid URL.\n\nType /help for supported platforms or instructions."
+        )
+        return
+
+    # Multiple links sent in a single message -> Sequential Batch Download!
+    if len(urls) > 1:
+        await _execute_batch_download(update, context, urls)
+        return
+
     url = resolve_short_url(urls[0])
 
     # Check if user sent inline trim time with the URL (e.g. "https://... 00:10-00:30")
@@ -565,6 +576,245 @@ async def _execute_fast_reel_download(update: Update, context: ContextTypes.DEFA
         await context.bot.send_message(chat_id, f"❌ Failed to send video: {_h(str(e))}", parse_mode="HTML")
     finally:
         cleanup_session(file_path)
+
+
+# ── 📦 Sequential Batch Downloader ──────────────────────────────────────────
+
+async def _execute_batch_download(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    urls: list[str],
+) -> None:
+    """Processes multiple links sent in a single message sequentially one by one."""
+    chat_id = update.effective_chat.id
+    user_id = update.effective_user.id
+    total = len(urls)
+    loop = asyncio.get_event_loop()
+
+    status_msg = await update.message.reply_text(
+        f"📋 <b>Batch Download: {total} links detected!</b>\n\n"
+        "⏳ Starting sequential download...",
+        parse_mode="HTML",
+    )
+
+    success_count = 0
+    fail_count = 0
+
+    for idx, raw_url in enumerate(urls, 1):
+        try:
+            await status_msg.edit_text(
+                f"📋 <b>Batch Download [{idx}/{total}]</b>\n\n"
+                f"🔗 <code>{_h(truncate(raw_url, 50))}</code>\n\n"
+                f"⏳ Fetching & downloading media...",
+                parse_mode="HTML",
+            )
+        except TelegramError:
+            pass
+
+        url = resolve_short_url(raw_url)
+
+        try:
+            info = await get_media_info(url)
+        except Exception as e:
+            logger.error("Batch info fetch error on %s: %s", url, e)
+            info = None
+
+        if not info:
+            fail_count += 1
+            await context.bot.send_message(
+                chat_id,
+                f"⚠️ <b>[{idx}/{total}] Failed to fetch info:</b>\n{_h(truncate(raw_url, 70))}\n<i>(Private, expired, or unsupported)</i>",
+                parse_mode="HTML",
+            )
+            continue
+
+        platform = info.get("platform", "Media").capitalize()
+        emoji = info.get("emoji", "🎬")
+        title = truncate(info.get("title", "Media Item"), 60)
+
+        # 1. Instagram Carousel
+        if info.get("is_carousel"):
+            items, _ = await loop.run_in_executor(None, download_carousel_media, url)
+            if not items:
+                fail_count += 1
+                await context.bot.send_message(
+                    chat_id,
+                    f"❌ <b>[{idx}/{total}] Could not download album:</b>\n{_h(title)}",
+                    parse_mode="HTML",
+                )
+                continue
+
+            caption = (
+                f"📸 Instagram ({len(items)} items) [{idx}/{total}]\n"
+                f"📌 {title}\n\n"
+                f"🤖 @butcherbombit_bot"
+            )
+
+            try:
+                if len(items) == 1:
+                    it = items[0]
+                    if it["type"] == "photo":
+                        with open(it["path"], "rb") as f:
+                            await context.bot.send_photo(chat_id, photo=f, caption=caption)
+                    else:
+                        await _send_video_message(context.bot, chat_id, it["path"], caption)
+                else:
+                    batches = [items[i:i + 10] for i in range(0, len(items), 10)]
+                    for b_idx, batch in enumerate(batches):
+                        media_group = []
+                        opened_files = []
+                        for b_i, it in enumerate(batch):
+                            is_first = (b_idx == 0 and b_i == 0)
+                            c_text = caption if is_first else None
+                            if it["type"] == "photo":
+                                f = open(it["path"], "rb")
+                                opened_files.append(f)
+                                media_group.append(InputMediaPhoto(media=f, caption=c_text))
+                            else:
+                                f = open(it["path"], "rb")
+                                opened_files.append(f)
+                                thumb_f = None
+                                if it.get("thumbnail_path") and os.path.isfile(it["thumbnail_path"]):
+                                    thumb_f = open(it["thumbnail_path"], "rb")
+                                    opened_files.append(thumb_f)
+                                media_group.append(
+                                    InputMediaVideo(
+                                        media=f,
+                                        caption=c_text,
+                                        width=it.get("width"),
+                                        height=it.get("height"),
+                                        duration=it.get("duration"),
+                                        thumbnail=thumb_f,
+                                        supports_streaming=True,
+                                    )
+                                )
+                        try:
+                            await context.bot.send_media_group(chat_id=chat_id, media=media_group, read_timeout=180, write_timeout=180)
+                        finally:
+                            for f in opened_files:
+                                try:
+                                    f.close()
+                                except Exception:
+                                    pass
+
+                success_count += 1
+                increment_download_count(user_id)
+            except Exception as e:
+                logger.error("Batch carousel send error: %s", e)
+                fail_count += 1
+            finally:
+                if items and "path" in items[0]:
+                    cleanup_session(items[0]["path"])
+            continue
+
+        # 2. Single Photo (Pinterest Image, etc.)
+        if info.get("is_photo"):
+            photo_url = info.get("photo_url")
+            file_path = await loop.run_in_executor(None, download_photo, photo_url)
+            if not file_path or not os.path.isfile(file_path):
+                fail_count += 1
+                await context.bot.send_message(
+                    chat_id,
+                    f"❌ <b>[{idx}/{total}] Could not download photo:</b>\n{_h(title)}",
+                    parse_mode="HTML",
+                )
+                continue
+
+            size = file_size_mb(file_path)
+            caption = (
+                f"{emoji} {platform} [{idx}/{total}]\n"
+                f"📌 {title}\n"
+                f"📦 {size:.2f} MB\n\n"
+                f"🤖 @butcherbombit_bot"
+            )
+            try:
+                with open(file_path, "rb") as f:
+                    await context.bot.send_photo(chat_id=chat_id, photo=f, caption=caption, read_timeout=120, write_timeout=120)
+                success_count += 1
+                increment_download_count(user_id)
+            except Exception as e:
+                logger.error("Batch photo send error: %s", e)
+                fail_count += 1
+            finally:
+                cleanup_session(file_path)
+            continue
+
+        # 3. Audio platform (SoundCloud, etc.)
+        if info.get("platform") == "soundcloud":
+            file_path = await download_audio(url)
+            if not file_path or not os.path.isfile(file_path):
+                fail_count += 1
+                continue
+            size = file_size_mb(file_path)
+            caption = (
+                f"🎧 SoundCloud [{idx}/{total}]\n"
+                f"📌 {title}\n"
+                f"📦 {size:.1f} MB\n\n"
+                f"🤖 @butcherbombit_bot"
+            )
+            thumb_path = get_session_thumbnail(file_path)
+            try:
+                with open(file_path, "rb") as f:
+                    thumb_f = open(thumb_path, "rb") if thumb_path and os.path.isfile(thumb_path) else None
+                    try:
+                        await context.bot.send_audio(chat_id, audio=f, caption=caption, title=title, thumbnail=thumb_f)
+                    finally:
+                        if thumb_f:
+                            thumb_f.close()
+                success_count += 1
+                increment_download_count(user_id)
+            except Exception as e:
+                logger.error("Batch audio send error: %s", e)
+                fail_count += 1
+            finally:
+                cleanup_session(file_path)
+            continue
+
+        # 4. Standard Video / Reel / Short
+        file_path = await download_video(url, height=None)
+        if not file_path or not os.path.isfile(file_path):
+            fail_count += 1
+            await context.bot.send_message(
+                chat_id,
+                f"❌ <b>[{idx}/{total}] Download failed for:</b>\n{_h(title)}",
+                parse_mode="HTML",
+            )
+            continue
+
+        size = file_size_mb(file_path)
+        target_path = file_path
+        if size > MAX_FILE_SIZE_MB:
+            compressed = await loop.run_in_executor(None, compress_video_to_size, file_path, 46.0)
+            if compressed and os.path.isfile(compressed):
+                target_path = compressed
+                size = file_size_mb(target_path)
+
+        caption = (
+            f"{emoji} {platform} [{idx}/{total}]\n"
+            f"📌 {title}\n"
+            f"📦 {size:.1f} MB\n\n"
+            f"🤖 @butcherbombit_bot"
+        )
+        try:
+            await _send_video_message(context.bot, chat_id, target_path, caption)
+            success_count += 1
+            increment_download_count(user_id)
+        except Exception as e:
+            logger.error("Batch video send error: %s", e)
+            fail_count += 1
+        finally:
+            cleanup_session(file_path)
+
+    try:
+        await status_msg.edit_text(
+            f"🎉 <b>Batch Download Complete!</b>\n\n"
+            f"✅ Downloaded: <b>{success_count}</b>\n"
+            f"⚠️ Failed: <b>{fail_count}</b>\n"
+            f"📦 Total processed: <b>{total}</b> links",
+            parse_mode="HTML",
+        )
+    except TelegramError:
+        pass
 
 
 # ── ✂️ Trim Download Execution ───────────────────────────────────────────────
