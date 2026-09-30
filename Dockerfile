@@ -1,8 +1,8 @@
 FROM python:3.11-slim
 
-# Install system dependencies including ffmpeg
+# Install system dependencies including ffmpeg and nodejs
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends ffmpeg && \
+    apt-get install -y --no-install-recommends ffmpeg nodejs && \
     rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
