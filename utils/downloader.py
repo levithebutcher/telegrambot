@@ -190,6 +190,36 @@ def _make_session_dir() -> str:
     return path
 
 
+def get_cookie_file_path() -> Optional[str]:
+    """
+    Checks if cookies are provided via:
+    1. A physical file named 'cookies.txt'
+    2. An environment variable 'YOUTUBE_COOKIES' (raw text or base64)
+    Returns path to the cookie file or None.
+    """
+    if os.path.isfile("cookies.txt") and os.path.getsize("cookies.txt") > 10:
+        return "cookies.txt"
+
+    env_cookies = os.getenv("YOUTUBE_COOKIES", "").strip()
+    if env_cookies:
+        cookie_path = os.path.join(DOWNLOAD_DIR, "session_cookies.txt")
+        try:
+            import base64
+            try:
+                decoded = base64.b64decode(env_cookies).decode("utf-8")
+                if "youtube.com" in decoded or "# Netscape" in decoded:
+                    env_cookies = decoded
+            except Exception:
+                pass
+            with open(cookie_path, "w", encoding="utf-8") as f:
+                f.write(env_cookies)
+            return cookie_path
+        except Exception as e:
+            logger.warning("Could not write YOUTUBE_COOKIES: %s", e)
+
+    return None
+
+
 def _base_ydl_opts(out_dir: str) -> dict:
     opts = {
         "outtmpl": os.path.join(out_dir, "%(title).60s.%(ext)s"),
@@ -207,6 +237,10 @@ def _base_ydl_opts(out_dir: str) -> dict:
             }
         },
     }
+    cookie_path = get_cookie_file_path()
+    if cookie_path:
+        opts["cookiefile"] = cookie_path
+
     ffmpeg_dir = str(Path(FFMPEG_PATH).parent)
     if os.path.isfile(FFMPEG_PATH):
         opts["ffmpeg_location"] = ffmpeg_dir
@@ -214,7 +248,9 @@ def _base_ydl_opts(out_dir: str) -> dict:
 
 
 def _get_info(url: str) -> Optional[dict]:
-    """Fetch video metadata without downloading, trying android client first."""
+    """Fetch video metadata without downloading, trying cookies and client candidates."""
+    cookie_path = get_cookie_file_path()
+
     client_candidates = [
         ["android"],
         ["android", "web"],
@@ -229,6 +265,9 @@ def _get_info(url: str) -> Optional[dict]:
             "noplaylist": True,
             "socket_timeout": 30,
         }
+        if cookie_path:
+            opts["cookiefile"] = cookie_path
+
         if clients and ("youtube.com" in url or "youtu.be" in url):
             opts["extractor_args"] = {
                 "youtube": {
