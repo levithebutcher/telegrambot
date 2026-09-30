@@ -27,6 +27,8 @@ from utils.downloader import (
     parse_time_range,
     trim_media,
     get_session_thumbnail,
+    compress_video_to_size,
+    split_video_by_size,
     MAX_FILE_SIZE_MB,
 )
 from utils.helpers import is_valid_url, truncate, human_size, progress_bar
@@ -456,6 +458,136 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             await query.answer("❌ Aapne abhi tak channel join nahi kiya! Pehle join karein.", show_alert=True)
         return
 
+    # ── LARGE VIDEO: COMPRESS OPTION ─────────────────────────────────────────
+    if action == "large_compress":
+        file_path = context.user_data.get("large_file_path")
+        if not file_path or not os.path.exists(file_path):
+            await query.edit_message_text("⚠️ File expired. Please send the link again.")
+            return
+
+        chat_id = update.effective_chat.id
+        await query.edit_message_text(
+            "🗜️ <b>Compressing video to fit under 50 MB...</b>\n\n"
+            "⏳ Please wait, this takes about 1-2 minutes...",
+            parse_mode="HTML",
+        )
+        await context.bot.send_chat_action(chat_id, ChatAction.UPLOAD_VIDEO)
+
+        loop = asyncio.get_event_loop()
+        compressed_path = await loop.run_in_executor(None, compress_video_to_size, file_path, 46.0)
+
+        target = compressed_path if compressed_path and os.path.isfile(compressed_path) else file_path
+        comp_size = file_size_mb(target)
+
+        media_info = context.user_data.get("pending_info") or {}
+        m_title = truncate(media_info.get("title", ""), 60)
+        m_emoji = media_info.get("emoji", "🎬")
+        m_platform = media_info.get("platform", "").capitalize()
+
+        caption = (
+            f"{m_emoji} {m_platform} (🗜️ Compressed)\n"
+            f"📌 {m_title}\n"
+            f"📦 {comp_size:.1f} MB\n\n"
+            f"🤖 @butcherbombit_bot"
+        )
+
+        try:
+            await query.edit_message_text("📤 <b>Uploading compressed video...</b>", parse_mode="HTML")
+        except Exception:
+            pass
+
+        try:
+            with open(target, "rb") as f:
+                await context.bot.send_video(
+                    chat_id,
+                    video=f,
+                    caption=caption,
+                    supports_streaming=True,
+                )
+            increment_download_count(query.from_user.id)
+            try:
+                await query.delete_message()
+            except Exception:
+                pass
+        except Exception as e:
+            logger.error("Failed to send compressed video: %s", e)
+            await context.bot.send_message(chat_id, f"❌ Failed to send video: {_h(str(e))}", parse_mode="HTML")
+        finally:
+            cleanup_session(file_path)
+            context.user_data.pop("large_file_path", None)
+        return
+
+    # ── LARGE VIDEO: SPLIT INTO PARTS OPTION ─────────────────────────────────
+    if action == "large_split":
+        file_path = context.user_data.get("large_file_path")
+        if not file_path or not os.path.exists(file_path):
+            await query.edit_message_text("⚠️ File expired. Please send the link again.")
+            return
+
+        chat_id = update.effective_chat.id
+        await query.edit_message_text(
+            "✂️ <b>Splitting video into high-quality parts...</b>\n\n"
+            "⏳ Please wait...",
+            parse_mode="HTML",
+        )
+        await context.bot.send_chat_action(chat_id, ChatAction.UPLOAD_VIDEO)
+
+        loop = asyncio.get_event_loop()
+        parts = await loop.run_in_executor(None, split_video_by_size, file_path, 46.0)
+
+        if not parts:
+            await query.edit_message_text("❌ Failed to split video.")
+            cleanup_session(file_path)
+            return
+
+        total_parts = len(parts)
+        media_info = context.user_data.get("pending_info") or {}
+        m_title = truncate(media_info.get("title", ""), 50)
+        m_emoji = media_info.get("emoji", "🎬")
+        m_platform = media_info.get("platform", "").capitalize()
+
+        for idx, part_path in enumerate(parts):
+            part_num = idx + 1
+            part_size = file_size_mb(part_path)
+            caption = (
+                f"{m_emoji} {m_platform} (Part {part_num}/{total_parts})\n"
+                f"📌 {m_title}\n"
+                f"📦 {part_size:.1f} MB\n\n"
+                f"🤖 @butcherbombit_bot"
+            )
+            try:
+                await query.edit_message_text(f"📤 <b>Uploading Part {part_num}/{total_parts}...</b>", parse_mode="HTML")
+            except Exception:
+                pass
+
+            try:
+                with open(part_path, "rb") as f:
+                    await context.bot.send_video(
+                        chat_id,
+                        video=f,
+                        caption=caption,
+                        supports_streaming=True,
+                    )
+            except Exception as e:
+                logger.error("Failed to send part %s: %s", part_num, e)
+
+        increment_download_count(query.from_user.id)
+        try:
+            await query.delete_message()
+        except Exception:
+            pass
+        cleanup_session(file_path)
+        context.user_data.pop("large_file_path", None)
+        return
+
+    # ── LARGE VIDEO: CANCEL OPTION ──────────────────────────────────────────
+    if action == "large_cancel":
+        file_path = context.user_data.pop("large_file_path", None)
+        if file_path:
+            cleanup_session(file_path)
+        await query.edit_message_text("✅ Download cancelled.")
+        return
+
     url = context.user_data.get("pending_url")
     if not url:
         await query.edit_message_text("⚠️ Session expired. Please send the URL again.")
@@ -511,14 +643,22 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
         size = file_size_mb(file_path)
         if size > MAX_FILE_SIZE_MB:
-            await context.bot.send_message(
-                chat_id,
-                f"⚠️ File is too large (<b>{size:.1f} MB</b>).\n"
-                f"Telegram allows max <b>{MAX_FILE_SIZE_MB} MB</b>.\n"
-                f"Please try a lower quality.",
+            context.user_data["large_file_path"] = file_path
+            context.user_data["large_file_size"] = size
+            kb = [
+                [InlineKeyboardButton("🗜️ Compress Video (Single File < 50MB)", callback_data=_encode_cb("large_compress"))],
+                [InlineKeyboardButton("✂️ Split into Parts (High Quality)", callback_data=_encode_cb("large_split"))],
+                [InlineKeyboardButton("❌ Cancel", callback_data=_encode_cb("large_cancel"))],
+            ]
+            await query.edit_message_text(
+                f"⚠️ <b>Video size is {size:.1f} MB (Exceeds Telegram 50 MB limit)</b>\n\n"
+                "Aap is video ko kaise receive karna chahte hain?\n\n"
+                "• <b>🗜️ Compress:</b> Video compress hoke <b>1 hi single file</b> mein aayegi.\n"
+                "• <b>✂️ Split:</b> Original high quality rahegi aur <b>Part 1, Part 2</b> mein aayegi.\n\n"
+                "Neeche se apna option chunein:",
                 parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup(kb),
             )
-            cleanup_session(file_path)
             return
 
         media_info = context.user_data.get("pending_info") or {}

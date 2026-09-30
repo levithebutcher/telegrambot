@@ -404,3 +404,121 @@ def cleanup_session(path: str) -> None:
         Path(folder).rmdir()
     except Exception as e:
         logger.warning("Cleanup failed: %s", e)
+
+
+def get_media_duration(file_path: str) -> float:
+    """Get duration of a media file in seconds using ffprobe or ffmpeg."""
+    ffmpeg_exe = FFMPEG_PATH if os.path.isfile(FFMPEG_PATH) else "ffmpeg"
+    try:
+        cmd = [ffmpeg_exe, "-i", file_path]
+        res = subprocess.run(cmd, stderr=subprocess.PIPE, text=True, timeout=15)
+        m = re.search(r"Duration:\s*(\d+):(\d+):(\d+\.\d+)", res.stderr)
+        if m:
+            h, mn, s = m.groups()
+            return int(h) * 3600 + int(mn) * 60 + float(s)
+    except Exception as e:
+        logger.warning("Could not determine duration for %s: %s", file_path, e)
+    return 0.0
+
+
+def compress_video_to_size(input_path: str, target_size_mb: float = 46.0) -> Optional[str]:
+    """
+    Compress video to target_size_mb so it fits under Telegram's 50MB limit.
+    Returns compressed file path or None on failure.
+    """
+    if not os.path.isfile(input_path):
+        return None
+
+    duration = get_media_duration(input_path)
+    if duration <= 0:
+        duration = 600.0  # fallback assumption 10 min
+
+    # Calculate target video bitrate in kbps
+    audio_bitrate_k = 96
+    total_target_bits = target_size_mb * 8 * 1024 * 1024
+    total_bitrate_k = (total_target_bits / duration) / 1000
+    video_bitrate_k = max(int(total_bitrate_k - audio_bitrate_k), 100)
+
+    p = Path(input_path)
+    out_path = str(p.parent / f"compressed_{p.stem}.mp4")
+    ffmpeg_exe = FFMPEG_PATH if os.path.isfile(FFMPEG_PATH) else "ffmpeg"
+
+    cmd = [
+        ffmpeg_exe,
+        "-y",
+        "-i", input_path,
+        "-c:v", "libx264",
+        "-b:v", f"{video_bitrate_k}k",
+        "-maxrate", f"{int(video_bitrate_k * 1.3)}k",
+        "-bufsize", f"{video_bitrate_k * 2}k",
+        "-preset", "faster",
+        "-c:a", "aac",
+        "-b:a", f"{audio_bitrate_k}k",
+        out_path,
+    ]
+    try:
+        res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=300)
+        if res.returncode == 0 and os.path.isfile(out_path) and os.path.getsize(out_path) > 1024:
+            return out_path
+        logger.error("Compress failed: %s", res.stderr)
+    except Exception as e:
+        logger.error("compress_video_to_size error: %s", e)
+    return None
+
+
+def split_video_by_size(input_path: str, max_chunk_mb: float = 46.0) -> list[str]:
+    """
+    Split a large video into multiple parts so each part is under max_chunk_mb.
+    Returns list of file paths for the parts.
+    """
+    import math
+
+    if not os.path.isfile(input_path):
+        return []
+
+    total_size = file_size_mb(input_path)
+    duration = get_media_duration(input_path)
+    if total_size <= max_chunk_mb or duration <= 0:
+        return [input_path]
+
+    num_parts = math.ceil(total_size / max_chunk_mb)
+    part_duration = duration / num_parts
+
+    p = Path(input_path)
+    ffmpeg_exe = FFMPEG_PATH if os.path.isfile(FFMPEG_PATH) else "ffmpeg"
+    parts: list[str] = []
+
+    for i in range(num_parts):
+        start_t = i * part_duration
+        out_part = str(p.parent / f"part_{i + 1}_{p.stem}.mp4")
+
+        cmd = [
+            ffmpeg_exe,
+            "-y",
+            "-ss", str(round(start_t, 2)),
+            "-t", str(round(part_duration, 2)),
+            "-i", input_path,
+            "-c", "copy",
+            out_part,
+        ]
+        try:
+            res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=120)
+            if res.returncode == 0 and os.path.isfile(out_part) and os.path.getsize(out_part) > 1024:
+                parts.append(out_part)
+            else:
+                cmd_reencode = [
+                    ffmpeg_exe,
+                    "-y",
+                    "-ss", str(round(start_t, 2)),
+                    "-t", str(round(part_duration, 2)),
+                    "-i", input_path,
+                    "-preset", "faster",
+                    out_part,
+                ]
+                res2 = subprocess.run(cmd_reencode, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=240)
+                if res2.returncode == 0 and os.path.isfile(out_part):
+                    parts.append(out_part)
+        except Exception as e:
+            logger.error("Error creating part %s: %s", i + 1, e)
+
+    return parts
