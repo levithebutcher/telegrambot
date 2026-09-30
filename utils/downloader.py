@@ -180,6 +180,112 @@ def get_session_thumbnail(file_path: str) -> Optional[str]:
     return None
 
 
+def get_video_metadata_and_thumb(file_path: str) -> dict:
+    """
+    Extracts width, height, duration and generates an optimized JPEG thumbnail (max 320x320, < 200KB)
+    for Telegram's send_video.
+    Returns:
+        {
+            "width": Optional[int],
+            "height": Optional[int],
+            "duration": Optional[int],
+            "thumbnail_path": Optional[str],
+        }
+    """
+    meta = {
+        "width": None,
+        "height": None,
+        "duration": None,
+        "thumbnail_path": None,
+    }
+    if not file_path or not os.path.isfile(file_path):
+        return meta
+
+    ffmpeg_exe = FFMPEG_PATH if os.path.isfile(FFMPEG_PATH) else "ffmpeg"
+    duration_sec = 0.0
+
+    # 1. Probe video with ffmpeg to get duration and dimensions
+    try:
+        cmd = [ffmpeg_exe, "-i", file_path]
+        res = subprocess.run(cmd, stderr=subprocess.PIPE, text=True, timeout=15)
+        stderr = res.stderr
+
+        m_dur = re.search(r"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)", stderr)
+        if m_dur:
+            h, mn, s = m_dur.groups()
+            duration_sec = int(h) * 3600 + int(mn) * 60 + float(s)
+            meta["duration"] = int(round(duration_sec))
+
+        m_wh = re.search(r"Stream #.*Video:.*,\s*(\d{2,5})x(\d{2,5})", stderr)
+        if m_wh:
+            meta["width"] = int(m_wh.group(1))
+            meta["height"] = int(m_wh.group(2))
+    except Exception as e:
+        logger.warning("Error probing video %s: %s", file_path, e)
+
+    # 2. Generate thumbnail frame
+    try:
+        p = Path(file_path)
+        folder = p.parent
+        raw_thumb = str(folder / f"raw_thumb_{p.stem}.jpg")
+        final_thumb = str(folder / f"thumb_{p.stem}.jpg")
+
+        seek_time = 1.0
+        if 0 < duration_sec < 2.0:
+            seek_time = max(0.1, duration_sec / 2.0)
+
+        thumb_cmd = [
+            ffmpeg_exe,
+            "-y",
+            "-ss", str(round(seek_time, 2)),
+            "-i", file_path,
+            "-vframes", "1",
+            "-q:v", "2",
+            raw_thumb,
+        ]
+        subprocess.run(thumb_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=20)
+
+        if not os.path.isfile(raw_thumb) or os.path.getsize(raw_thumb) < 100:
+            thumb_cmd[2] = "0"
+            subprocess.run(thumb_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=20)
+
+        source_thumb = None
+        if os.path.isfile(raw_thumb) and os.path.getsize(raw_thumb) > 100:
+            source_thumb = raw_thumb
+        else:
+            existing = get_session_thumbnail(file_path)
+            if existing and os.path.isfile(existing):
+                source_thumb = existing
+
+        if source_thumb and os.path.isfile(source_thumb):
+            with Image.open(source_thumb) as img:
+                actual_w, actual_h = img.size
+                if meta["width"] and meta["height"]:
+                    if (meta["width"] > meta["height"] and actual_w < actual_h) or (
+                        meta["width"] < meta["height"] and actual_w > actual_h
+                    ):
+                        meta["width"], meta["height"] = meta["height"], meta["width"]
+                else:
+                    meta["width"], meta["height"] = actual_w, actual_h
+
+                img_copy = img.copy()
+                img_copy.thumbnail((320, 320), Image.Resampling.LANCZOS)
+                img_copy.convert("RGB").save(final_thumb, "JPEG", quality=85, optimize=True)
+
+            if os.path.isfile(final_thumb) and os.path.getsize(final_thumb) > 100:
+                meta["thumbnail_path"] = final_thumb
+
+        if os.path.isfile(raw_thumb):
+            try:
+                os.remove(raw_thumb)
+            except OSError:
+                pass
+    except Exception as e:
+        logger.warning("Error generating thumbnail for %s: %s", file_path, e)
+
+    return meta
+
+
 # ── yt-dlp helpers ──────────────────────────────────────────────────────────
 
 def _make_session_dir() -> str:

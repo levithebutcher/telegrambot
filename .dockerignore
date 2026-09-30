@@ -5,3 +5,5 @@ bot.log
 __pycache__/
 *.pyc
 .git/
+*cookies.txt
+cookies*

@@ -27,6 +27,7 @@ from utils.downloader import (
     parse_time_range,
     trim_media,
     get_session_thumbnail,
+    get_video_metadata_and_thumb,
     compress_video_to_size,
     split_video_by_size,
     MAX_FILE_SIZE_MB,
@@ -263,6 +264,49 @@ async def url_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         pass
 
 
+async def _send_video_message(
+    bot,
+    chat_id: int,
+    file_path: str,
+    caption: str,
+) -> None:
+    """
+    Sends video to Telegram with exact width, height, duration and optimized thumbnail
+    so the Telegram player renders crisp preview and correct aspect ratio (16:9, 9:16 Shorts/Reels, 1:1).
+    """
+    loop = asyncio.get_event_loop()
+    meta = await loop.run_in_executor(None, get_video_metadata_and_thumb, file_path)
+    thumb_path = meta.get("thumbnail_path")
+    thumb_file = None
+    if thumb_path and os.path.isfile(thumb_path):
+        try:
+            thumb_file = open(thumb_path, "rb")
+        except Exception as e:
+            logger.warning("Could not open thumbnail %s: %s", thumb_path, e)
+            thumb_file = None
+
+    try:
+        with open(file_path, "rb") as f:
+            await bot.send_video(
+                chat_id=chat_id,
+                video=f,
+                caption=caption,
+                width=meta.get("width"),
+                height=meta.get("height"),
+                duration=meta.get("duration"),
+                thumbnail=thumb_file,
+                supports_streaming=True,
+                read_timeout=120,
+                write_timeout=120,
+            )
+    finally:
+        if thumb_file:
+            try:
+                thumb_file.close()
+            except Exception:
+                pass
+
+
 # ── ⚡ Fast Reel / Short Download ───────────────────────────────────────────
 
 async def _execute_fast_reel_download(update: Update, context: ContextTypes.DEFAULT_TYPE, url: str) -> None:
@@ -315,13 +359,7 @@ async def _execute_fast_reel_download(update: Update, context: ContextTypes.DEFA
 
     await context.bot.send_chat_action(chat_id, ChatAction.UPLOAD_VIDEO)
     try:
-        with open(file_path, "rb") as f:
-            await context.bot.send_video(
-                chat_id,
-                video=f,
-                caption=caption,
-                supports_streaming=True,
-            )
+        await _send_video_message(context.bot, chat_id, file_path, caption)
         increment_download_count(update.effective_user.id)
         # Delete progress message cleanly
         try:
@@ -403,13 +441,7 @@ async def _execute_trim_download(
 
     await context.bot.send_chat_action(chat_id, ChatAction.UPLOAD_VIDEO)
     try:
-        with open(target_path, "rb") as f:
-            await context.bot.send_video(
-                chat_id,
-                video=f,
-                caption=caption,
-                supports_streaming=True,
-            )
+        await _send_video_message(context.bot, chat_id, target_path, caption)
         increment_download_count(update.effective_user.id)
         try:
             await status_msg.delete()
@@ -497,13 +529,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             pass
 
         try:
-            with open(target, "rb") as f:
-                await context.bot.send_video(
-                    chat_id,
-                    video=f,
-                    caption=caption,
-                    supports_streaming=True,
-                )
+            await _send_video_message(context.bot, chat_id, target, caption)
             increment_download_count(query.from_user.id)
             try:
                 await query.delete_message()
@@ -561,13 +587,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 pass
 
             try:
-                with open(part_path, "rb") as f:
-                    await context.bot.send_video(
-                        chat_id,
-                        video=f,
-                        caption=caption,
-                        supports_streaming=True,
-                    )
+                await _send_video_message(context.bot, chat_id, part_path, caption)
             except Exception as e:
                 logger.error("Failed to send part %s: %s", part_num, e)
 
@@ -685,13 +705,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
         await context.bot.send_chat_action(chat_id, ChatAction.UPLOAD_VIDEO)
         try:
-            with open(file_path, "rb") as f:
-                await context.bot.send_video(
-                    chat_id,
-                    video=f,
-                    caption=caption,
-                    supports_streaming=True,
-                )
+            await _send_video_message(context.bot, chat_id, file_path, caption)
             increment_download_count(query.from_user.id)
             try:
                 await context.bot.delete_message(chat_id=chat_id, message_id=query.message.message_id)
