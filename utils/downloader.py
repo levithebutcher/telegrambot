@@ -176,28 +176,65 @@ def extract_pinterest_pin_fallback(url: str) -> Optional[dict]:
         return None
 
 
+def get_photo_quality_score(thumb: dict) -> int:
+    """
+    Returns an accurate resolution/quality score for thumbnails across platforms
+    (Instagram, Pinterest, Twitter/X, YouTube).
+    """
+    if not isinstance(thumb, dict):
+        return 0
+
+    url = thumb.get("url", "")
+    w = thumb.get("width")
+    h = thumb.get("height")
+
+    # 1. If explicit width & height are provided
+    if w and h and int(w) > 0 and int(h) > 0:
+        return int(w) * int(h)
+
+    # 2. Pinterest originals (uncompressed raw original)
+    if "/originals/" in url:
+        return 100_000_000
+
+    # 3. Instagram high-res patterns
+    if any(k in url for k in ("instagram", "cdninstagram", "fbcdn.net")):
+        # If no downscaling parameter (like stp=...s150x150), it is the raw original master photo!
+        if "stp=" not in url:
+            return 90_000_000
+
+        # Look for _s(\d+)x(\d+) in stp parameter (e.g. _s1080x1080 -> 1166400)
+        m = re.search(r"_s(\d+)x(\d+)", url)
+        if m:
+            return int(m.group(1)) * int(m.group(2))
+
+        # Look for /s(\d+)x(\d+)/
+        m = re.search(r"/s(\d+)x(\d+)/", url)
+        if m:
+            return int(m.group(1)) * int(m.group(2))
+
+    # 4. Twitter/X orig name
+    if "name=orig" in url:
+        return 80_000_000
+    if "name=large" in url:
+        return 70_000_000
+
+    return 1
+
+
 def get_best_photo_url(info: dict) -> Optional[str]:
     """Finds highest-resolution direct image URL from info dict (supporting Pinterest, Instagram, etc.)."""
-    if info.get("photo_url"):
-        return info["photo_url"]
-
     thumbs = info.get("thumbnails") or []
-    # 1. Look for Pinterest /originals/ URL
-    for t in thumbs:
-        u = t.get("url", "")
-        if "/originals/" in u:
-            return u
-
-    # 2. Find largest resolution thumbnail
     if thumbs:
-        best_t = max(thumbs, key=lambda t: (t.get("width") or 0) * (t.get("height") or 0))
+        best_t = max(thumbs, key=get_photo_quality_score)
         u = best_t.get("url")
         if u:
             if "pinimg.com" in u:
                 u = re.sub(r"/(?:736x|564x|474x|236x)/", "/originals/", u)
             return u
 
-    # 3. Fallback to info.get("thumbnail") or info.get("url")
+    if info.get("photo_url"):
+        return info["photo_url"]
+
     u = info.get("thumbnail") or info.get("url")
     if u:
         if "pinimg.com" in u:
@@ -973,7 +1010,7 @@ def download_carousel_media(url: str) -> Tuple[list[dict], dict]:
             thumbs = entry.get("thumbnails") or []
             img_url = None
             if thumbs:
-                best_img = max(thumbs, key=lambda t: (t.get("width") or 0) * (t.get("height") or 0))
+                best_img = max(thumbs, key=get_photo_quality_score)
                 img_url = best_img.get("url")
             if not img_url:
                 img_url = entry.get("url") or entry.get("thumbnail") or entry.get("photo_url")
