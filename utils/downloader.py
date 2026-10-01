@@ -493,12 +493,125 @@ def get_cookie_file_path() -> Optional[str]:
     return None
 
 
+def normalize_youtube_url(url: str) -> str:
+    """Normalize YouTube Shorts (/shorts/ID) to standard /watch?v=ID format."""
+    m = re.search(r"/(?:shorts)/([a-zA-Z0-9_-]+)", url)
+    if m:
+        return f"https://www.youtube.com/watch?v={m.group(1)}"
+    return url
+
+
+_last_media_errors: dict[str, str] = {}
+
+
+def get_last_media_error(url: str) -> Optional[str]:
+    return _last_media_errors.get(url)
+
+
+def classify_error(e: Exception, url: str) -> str:
+    """Returns a clean user-facing error message without raw tracebacks."""
+    err_str = str(e).lower()
+    if "login" in err_str or "sign in" in err_str or "use --cookies" in err_str:
+        if "instagram.com/stories" in url.lower() or "story" in url.lower():
+            return "🔒 <b>Instagram Story / Private Content</b>\n\nInstagram Stories dekhne aur download karne ke liye account login (session cookies) zaroori hoti hain."
+        return "🔒 <b>Login Required</b>\n\nYeh content private hai ya account login required hai."
+    elif "429" in err_str or "rate-limit" in err_str or "too many requests" in err_str:
+        return "⏳ <b>Rate Limited</b>\n\nPlatform ne temporarily request limit ki hai. Kripya 2-3 minute baad try karein."
+    elif "blocked" in err_str or "geo-restricted" in err_str:
+        return "🚫 <b>Geo-Restricted / Blocked</b>\n\nYeh media aapke region me available nahi hai."
+    elif "no video formats found" in err_str or "no video could be found" in err_str:
+        return "🖼️ <b>No Video Found</b>\n\nIs link me koi video ya download karne yogya format nahi mila."
+    return f"❌ <b>Download Error:</b> {html.escape(str(e).splitlines()[0][:150])}"
+
+
+def _extract_instagram_direct(url: str, ydl_opts: dict) -> Optional[dict]:
+    """Bypasses yt-dlp's raise_no_formats check to extract Instagram photo/carousel metadata."""
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            for ie in ydl._ies.values():
+                if ie.suitable(url) and getattr(ie, "IE_NAME", "") == "Instagram":
+                    ie_inst = ie(ydl)
+                    res = ie_inst.extract(url)
+                    if res:
+                        return res
+    except Exception as e:
+        logger.warning("Direct Instagram extraction failed for %s: %s", url, e)
+    return None
+
+
+def extract_with_gallery_dl(url: str) -> Optional[dict]:
+    """Uses gallery-dl's extractor to retrieve images for Twitter/X, Pinterest, etc. without cookies."""
+    try:
+        from gallery_dl import extractor
+        resolved = resolve_short_url(url)
+        ext = extractor.find(resolved)
+        if not ext:
+            return None
+
+        photo_urls = []
+        title = "Image"
+        uploader = "Unknown"
+        for item in ext:
+            if not isinstance(item, (list, tuple)) or len(item) < 2:
+                continue
+            msg_type = item[0]
+            if msg_type == 3 and isinstance(item[1], str) and item[1].startswith("http"):
+                photo_urls.append(item[1])
+                if len(item) > 2 and isinstance(item[2], dict):
+                    meta = item[2]
+                    if not title or title == "Image":
+                        title = meta.get("content") or meta.get("title") or meta.get("description") or title
+                    if not uploader or uploader == "Unknown":
+                        uploader = meta.get("user", {}).get("name") or meta.get("author", {}).get("name") or uploader
+            elif msg_type == 2 and isinstance(item[1], dict):
+                meta = item[1]
+                title = meta.get("content") or meta.get("title") or meta.get("description") or title
+                uploader = meta.get("user", {}).get("name") or meta.get("author", {}).get("name") or uploader
+                if meta.get("url") and any(ext_name in str(meta["url"]) for ext_name in (".webp", ".jpg", ".jpeg", ".png")):
+                    photo_urls.append(meta["url"])
+
+        if photo_urls:
+            seen = set()
+            uniq = []
+            for u in photo_urls:
+                if u not in seen:
+                    seen.add(u)
+                    uniq.append(u)
+            photo_urls = uniq
+
+            if len(photo_urls) == 1:
+                return {
+                    "title": str(title)[:80],
+                    "uploader": str(uploader),
+                    "url": resolved,
+                    "is_photo": True,
+                    "photo_url": photo_urls[0],
+                    "formats": [],
+                    "thumbnails": [{"url": photo_urls[0]}],
+                }
+            else:
+                entries = [{"thumbnails": [{"url": u}], "url": u, "title": title} for u in photo_urls]
+                return {
+                    "_type": "playlist",
+                    "title": str(title)[:80],
+                    "uploader": str(uploader),
+                    "url": resolved,
+                    "is_carousel": True,
+                    "entries": entries,
+                    "photo_url": photo_urls[0],
+                }
+    except Exception as e:
+        logger.warning("gallery-dl extraction error for %s: %s", url, e)
+    return None
+
+
 def _base_ydl_opts(out_dir: str) -> dict:
     opts = {
         "outtmpl": os.path.join(out_dir, "%(title).60s.%(ext)s"),
         "quiet": True,
         "no_warnings": True,
         "noplaylist": True,
+        "no_color": True,
         "socket_timeout": 30,
         "retries": 5,
         "concurrent_fragment_downloads": 4,
@@ -518,17 +631,20 @@ def _base_ydl_opts(out_dir: str) -> dict:
 
 
 def _get_info(url: str) -> Optional[dict]:
-    """Fetch video metadata without downloading, trying android client first without cookies."""
+    """Fetch video/photo metadata without downloading, trying cookie-free options and fallbacks."""
     url = resolve_short_url(url)
     cookie_path = get_cookie_file_path()
+    last_err: Optional[Exception] = None
 
-    # Step 1: Try Android client for YouTube (works without cookies, bypasses cloud blocks)
+    # Step 1: Normalize YouTube URL & Try Android client for YouTube
     if "youtube.com" in url or "youtu.be" in url:
+        url = normalize_youtube_url(url)
         android_opts = {
             "quiet": True,
             "no_warnings": True,
             "skip_download": True,
             "noplaylist": True,
+            "no_color": True,
             "socket_timeout": 30,
             "extractor_args": {
                 "youtube": {
@@ -542,6 +658,7 @@ def _get_info(url: str) -> Optional[dict]:
                 if info and (info.get("formats") or info.get("title")):
                     return info
         except Exception as e:
+            last_err = e
             logger.warning("Android client extraction failed for %s: %s", url, e)
 
     is_ig = "instagram.com" in url.lower()
@@ -553,6 +670,7 @@ def _get_info(url: str) -> Optional[dict]:
             "no_warnings": True,
             "skip_download": True,
             "noplaylist": not is_ig,
+            "no_color": True,
             "socket_timeout": 30,
             "cookiefile": cookie_path,
         }
@@ -562,6 +680,7 @@ def _get_info(url: str) -> Optional[dict]:
                 if info and (info.get("formats") or info.get("title") or info.get("entries") or info.get("thumbnails")):
                     return info
         except Exception as e:
+            last_err = e
             logger.warning("Cookie extraction failed for %s: %s", url, e)
 
     # Step 3: Default extraction (for Instagram, Twitter/X, TikTok, Reddit, Pinterest, etc.)
@@ -570,6 +689,7 @@ def _get_info(url: str) -> Optional[dict]:
         "no_warnings": True,
         "skip_download": True,
         "noplaylist": not is_ig,
+        "no_color": True,
         "socket_timeout": 30,
     }
     try:
@@ -578,15 +698,33 @@ def _get_info(url: str) -> Optional[dict]:
             if info:
                 return info
     except Exception as e:
+        last_err = e
         logger.warning("Default info extraction failed for %s: %s", url, e)
 
-    # Step 4: Fallback scraper for Pinterest image pins
+    # Step 4: Fallback for Instagram Photos & Carousels (bypassing raise_no_formats)
+    if is_ig:
+        direct_info = _extract_instagram_direct(url, default_opts)
+        if direct_info:
+            return direct_info
+
+    # Step 5: Fallback via gallery-dl for Twitter/X and Pinterest images
+    gdl_info = extract_with_gallery_dl(url)
+    if gdl_info:
+        return gdl_info
+
+    # Step 6: Fallback scraper for Pinterest image pins
     if "pinterest." in url.lower() or "pin.it" in url.lower():
         fallback_info = extract_pinterest_pin_fallback(url)
         if fallback_info:
             return fallback_info
 
+    # If all failed, record friendly error message and log full exception
+    if last_err:
+        logger.exception("All extraction attempts failed for %s: %s", url, last_err)
+        _last_media_errors[url] = classify_error(last_err, url)
+
     return None
+
 
 
 def _download_file(url: str, ydl_opts: dict, progress_state: Optional[dict] = None) -> Optional[str]:
@@ -746,12 +884,18 @@ def download_carousel_media(url: str) -> Tuple[list[dict], dict]:
     if cookie_path:
         opts["cookiefile"] = cookie_path
 
+    info = None
     try:
         with yt_dlp.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(url, download=False)
     except Exception as e:
-        logger.error("Failed to extract carousel info for %s: %s", url, e)
-        return [], {}
+        logger.warning("Standard carousel extraction failed for %s: %s, checking fallbacks", url, e)
+
+    if not info and "instagram.com" in url.lower():
+        info = _extract_instagram_direct(url, opts)
+
+    if not info:
+        info = extract_with_gallery_dl(url)
 
     if not info:
         return [], {}
@@ -832,7 +976,7 @@ def download_carousel_media(url: str) -> Tuple[list[dict], dict]:
                 best_img = max(thumbs, key=lambda t: (t.get("width") or 0) * (t.get("height") or 0))
                 img_url = best_img.get("url")
             if not img_url:
-                img_url = entry.get("url") or entry.get("thumbnail")
+                img_url = entry.get("url") or entry.get("thumbnail") or entry.get("photo_url")
 
             if img_url and _download_direct_file(img_url, target_path, referer="https://www.instagram.com/"):
                 try:
@@ -855,6 +999,9 @@ async def download_video(
     progress_state: Optional[dict] = None,
 ) -> Optional[str]:
     """Download best video (optionally at specific height). Returns file path."""
+    url = resolve_short_url(url)
+    if "youtube.com" in url or "youtu.be" in url:
+        url = normalize_youtube_url(url)
     out_dir = _make_session_dir()
     opts = _base_ydl_opts(out_dir)
 
@@ -882,6 +1029,9 @@ async def download_audio(
     progress_state: Optional[dict] = None,
 ) -> Optional[str]:
     """Download best audio as MP3 with ID3 tags & Album Art."""
+    url = resolve_short_url(url)
+    if "youtube.com" in url or "youtu.be" in url:
+        url = normalize_youtube_url(url)
     out_dir = _make_session_dir()
     opts = _base_ydl_opts(out_dir)
     opts.update(

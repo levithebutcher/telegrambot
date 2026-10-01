@@ -5,3 +5,5 @@ aiohttp
 aiofiles
 Pillow
 python-dotenv
+gallery-dl
+bgutil-ytdlp-pot-provider

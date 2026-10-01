@@ -34,6 +34,8 @@ from utils.downloader import (
     compress_video_to_size,
     split_video_by_size,
     MAX_FILE_SIZE_MB,
+    get_last_media_error,
+    classify_error,
 )
 from utils.helpers import is_valid_url, truncate, human_size, progress_bar
 from utils.db import add_or_update_user, increment_download_count
@@ -208,23 +210,25 @@ async def url_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     try:
         info = await get_media_info(url)
     except Exception as e:
-        logger.error("get_media_info failed: %s", e)
-        await thinking_msg.edit_text(
-            f"❌ <b>Failed to fetch info.</b>\n\n<code>{_h(str(e))}</code>",
-            parse_mode="HTML",
-        )
+        logger.exception("get_media_info failed for %s", url)
+        clean_err = classify_error(e, url)
+        await thinking_msg.edit_text(clean_err, parse_mode="HTML")
         return
 
     if not info:
-        await thinking_msg.edit_text(
-            "❌ <b>Could not fetch media info.</b>\n\n"
-            "Possible reasons:\n"
-            "• The URL is private or geo-restricted\n"
-            "• The platform is not supported\n"
-            "• The link has expired\n\n"
-            "Try a different link or check /help.",
-            parse_mode="HTML",
-        )
+        last_err = get_last_media_error(url)
+        if last_err:
+            msg = last_err
+        else:
+            msg = (
+                "❌ <b>Could not fetch media info.</b>\n\n"
+                "Possible reasons:\n"
+                "• The URL is private or requires login (e.g. Instagram Stories)\n"
+                "• The platform is temporarily rate-limiting requests\n"
+                "• The link has expired or is invalid\n\n"
+                "Try a different link or check /help."
+            )
+        await thinking_msg.edit_text(msg, parse_mode="HTML")
         return
 
     # ── Instagram Carousel / Multi-item Albums ──
