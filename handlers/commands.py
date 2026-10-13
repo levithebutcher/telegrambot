@@ -10,32 +10,38 @@ from handlers.admin import check_user_subscription, get_force_sub_channel
 
 
 START_TEXT = (
-    "👋 <b>Welcome to Universal Downloader Bot!</b>\n\n"
-    "I can download media from almost any platform — just send me a link!\n\n"
-    "<b>✨ Key Features:</b>\n"
-    "⚡ <b>Fast Auto-Download:</b> Instant 1-click download for Reels & Shorts\n"
-    "🎵 <b>High-Quality MP3:</b> Audio with embedded Album Art & ID3 tags\n"
-    "✂️ <b>Video Trimmer:</b> Cut specific video clips (e.g. <code>00:10 - 00:30</code>)\n"
-    "🎬 <b>Multi-Platform:</b> YouTube, Instagram, Twitter/X, TikTok, FB & more\n\n"
-    "Just paste any supported URL and I'll handle the rest!\n"
-    "Type /help for more info."
+    "👋 <b>Welcome to Multi-Mode Bot!</b>\n\n"
+    "Main media download bhi kar sakta hoon aur short/ad-links ko bypass bhi kar sakta hoon!\n\n"
+    "<b>✨ Key Modes:</b>\n"
+    "📥 <b>Download Mode (Default):</b> YouTube, Instagram, X/Twitter, Pinterest & Reels/Shorts\n"
+    "🔓 <b>Bypass Mode:</b> Shortened URLs aur ad-links ko direct link me convert karein\n\n"
+    "<b>⚡ Quick Features:</b>\n"
+    "• Fast 1-click download for Reels & Shorts\n"
+    "• High-Quality MP3 with album art\n"
+    "• Video trimming (e.g. <code>00:10 - 00:30</code>)\n"
+    "• Mode switch karne ke liye /mode command use karein!\n\n"
+    "Type /help for complete guide."
 )
 
 HELP_TEXT = (
-    "📖 <b>Help Guide & Features</b>\n\n"
-    "<b>1. Normal Download:</b>\n"
+    "📖 <b>Help Guide & Modes</b>\n\n"
+    "<b>1. Multi-Mode Switcher (/mode):</b>\n"
+    "• <b>📥 Download Mode:</b> Media download karne ke liye\n"
+    "• <b>🔓 Bypass Mode:</b> Short links / ad-links ko unshorten aur bypass karne ke liye (max 5 links ek sath)\n\n"
+    "<b>2. Normal Download:</b>\n"
     "• Send any YouTube/Instagram/TikTok link\n"
     "• Choose quality (360p / 720p / 1080p) or MP3\n\n"
-    "<b>2. Fast Reels/Shorts Download:</b>\n"
+    "<b>3. Fast Reels/Shorts Download:</b>\n"
     "• Send an Instagram Reel, YouTube Short, or TikTok link\n"
     "• Bot automatically downloads it in best quality instantly!\n\n"
-    "<b>3. Video Clip Trimmer:</b>\n"
+    "<b>4. Video Clip Trimmer:</b>\n"
     "• Method A: Send link with time: <code>https://youtu.be/... 00:10-00:30</code>\n"
     "• Method B: Send link, click <b>✂️ Trim Clip</b>, then reply with time range!\n\n"
-    "<b>4. MP3 Audio with Cover Art:</b>\n"
+    "<b>5. MP3 Audio with Cover Art:</b>\n"
     "• Select <b>🎵 MP3 Audio</b> for high quality audio with track thumbnail!\n\n"
     "<b>Commands:</b>\n"
     "/start — Welcome message\n"
+    "/mode — Switch between Download & Bypass mode\n"
     "/help — This help guide\n"
     "/about — About this bot"
 )
@@ -77,6 +83,7 @@ async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
     keyboard = [
         [
+            InlineKeyboardButton("⚙️ Mode Switcher", callback_data="mode:menu"),
             InlineKeyboardButton("📖 Help", callback_data="help"),
             InlineKeyboardButton("ℹ️ About", callback_data="about"),
         ],

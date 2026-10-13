@@ -7,6 +7,8 @@ from telegram.request import HTTPXRequest
 
 from utils.db import init_db
 from handlers.commands import start_handler, help_handler, about_handler
+from handlers.mode import mode_command_handler, mode_callback_handler
+from handlers.router import main_text_router
 from handlers.downloader import url_handler, button_handler, error_handler
 from handlers.admin import (
     admin_handler,
@@ -111,6 +113,7 @@ def main() -> None:
     app.add_handler(CommandHandler("start", start_handler))
     app.add_handler(CommandHandler("help", help_handler))
     app.add_handler(CommandHandler("about", about_handler))
+    app.add_handler(CommandHandler("mode", mode_command_handler))
 
     # Register admin commands
     app.add_handler(CommandHandler("admin", admin_handler))
@@ -119,8 +122,11 @@ def main() -> None:
     app.add_handler(CommandHandler("forcesub", forcesub_handler))
     app.add_handler(CommandHandler("broadcast", broadcast_handler))
 
-    # Register message handler (catches URLs and trim timestamps)
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, url_handler))
+    # Register message handler (catches URLs and trim timestamps, routed by active user mode)
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, main_text_router))
+
+    # Register mode callback query handler BEFORE general button handler (prevents JSON decode clash)
+    app.add_handler(CallbackQueryHandler(mode_callback_handler, pattern=r"^mode:"))
 
     # Register callback query handler (inline buttons & verification)
     app.add_handler(CallbackQueryHandler(button_handler))

@@ -40,6 +40,11 @@ from utils.downloader import (
 from utils.helpers import is_valid_url, truncate, human_size, progress_bar
 from utils.db import add_or_update_user, increment_download_count
 from handlers.admin import check_user_subscription, get_force_sub_channel
+from utils.uploader import (
+    send_video_via_telethon,
+    send_audio_via_telethon,
+    is_telethon_configured,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -301,10 +306,27 @@ async def _send_video_message(
     """
     Sends video to Telegram with exact width, height, duration and optimized thumbnail
     so the Telegram player renders crisp preview and correct aspect ratio (16:9, 9:16 Shorts/Reels, 1:1).
+    Automatically routes files > 50MB through Telethon MTProto client (up to 2GB).
     """
+    size = file_size_mb(file_path)
     loop = asyncio.get_event_loop()
     meta = await loop.run_in_executor(None, get_video_metadata_and_thumb, file_path)
     thumb_path = meta.get("thumbnail_path")
+
+    # If file > 50MB and Telethon is configured, upload via Telethon MTProto client (up to 2GB)
+    if size > 50 and is_telethon_configured():
+        try:
+            logger.info("Routing %s (%.1f MB) through Telethon MTProto client...", file_path, size)
+            await send_video_via_telethon(
+                chat_id=chat_id,
+                file_path=file_path,
+                caption=caption,
+                meta=meta,
+            )
+            return
+        except Exception as e:
+            logger.error("send_video_via_telethon failed: %s. Falling back to Bot API.", e)
+
     thumb_file = None
     if thumb_path and os.path.isfile(thumb_path):
         try:
@@ -324,8 +346,8 @@ async def _send_video_message(
                 duration=meta.get("duration"),
                 thumbnail=thumb_file,
                 supports_streaming=True,
-                read_timeout=120,
-                write_timeout=120,
+                read_timeout=180,
+                write_timeout=180,
             )
     finally:
         if thumb_file:
@@ -1111,6 +1133,14 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
         size = file_size_mb(file_path)
         if size > MAX_FILE_SIZE_MB:
+            await query.edit_message_text(
+                f"⚠️ <b>Video size is {size:.1f} MB (Exceeds Telegram 2 GB limit)</b>\n\n"
+                f"Telegram maximum allowed upload size is {MAX_FILE_SIZE_MB} MB (2 GB).",
+                parse_mode="HTML",
+            )
+            cleanup_session(file_path)
+            return
+        elif size > 50 and not is_telethon_configured():
             context.user_data["large_file_path"] = file_path
             context.user_data["large_file_size"] = size
             kb = [
@@ -1228,11 +1258,12 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         # Check for album art thumbnail
         thumb_path = get_session_thumbnail(file_path)
 
+        upload_label = "📤 <b>Uploading audio via MTProto (up to 2GB)...</b>" if size > 50 else "📤 <b>Uploading audio...</b>"
         try:
             await context.bot.edit_message_text(
                 chat_id=chat_id,
                 message_id=query.message.message_id,
-                text="📤 <b>Uploading audio...</b>",
+                text=upload_label,
                 parse_mode="HTML",
             )
         except TelegramError:
@@ -1240,20 +1271,30 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
         await context.bot.send_chat_action(chat_id, ChatAction.UPLOAD_VOICE)
         try:
-            with open(file_path, "rb") as f:
-                thumb_file = open(thumb_path, "rb") if thumb_path and os.path.isfile(thumb_path) else None
-                try:
-                    await context.bot.send_audio(
-                        chat_id,
-                        audio=f,
-                        caption=caption,
-                        title=m_title,
-                        performer=m_uploader,
-                        thumbnail=thumb_file,
-                    )
-                finally:
-                    if thumb_file:
-                        thumb_file.close()
+            if size > 50 and is_telethon_configured():
+                await send_audio_via_telethon(
+                    chat_id=chat_id,
+                    file_path=file_path,
+                    caption=caption,
+                    title=m_title,
+                    performer=m_uploader,
+                    thumb_path=thumb_path,
+                )
+            else:
+                with open(file_path, "rb") as f:
+                    thumb_file = open(thumb_path, "rb") if thumb_path and os.path.isfile(thumb_path) else None
+                    try:
+                        await context.bot.send_audio(
+                            chat_id,
+                            audio=f,
+                            caption=caption,
+                            title=m_title,
+                            performer=m_uploader,
+                            thumbnail=thumb_file,
+                        )
+                    finally:
+                        if thumb_file:
+                            thumb_file.close()
 
             increment_download_count(query.from_user.id)
             try:

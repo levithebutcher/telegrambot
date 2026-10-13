@@ -7,3 +7,6 @@ Pillow
 python-dotenv
 gallery-dl
 bgutil-ytdlp-pot-provider
+beautifulsoup4
+httpx
+telethon

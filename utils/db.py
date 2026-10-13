@@ -41,6 +41,15 @@ def init_db() -> None:
             )
             """
         )
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS user_modes (
+                user_id INTEGER PRIMARY KEY,
+                mode TEXT NOT NULL DEFAULT 'download',
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
         conn.commit()
 
 
@@ -140,3 +149,48 @@ def set_setting(key: str, value: str) -> None:
             conn.commit()
     except Exception as e:
         logger.error("Failed to set setting %s: %s", key, e)
+
+
+def get_user_mode(user_id: int) -> str:
+    """Get the active mode for a user ('download' or 'bypass'). Default: 'download'."""
+    try:
+        with get_db() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT mode FROM user_modes WHERE user_id = ?", (user_id,))
+            row = cursor.fetchone()
+            return row["mode"] if row and row["mode"] else "download"
+    except Exception as e:
+        logger.error("Failed to get user mode for %s: %s", user_id, e)
+        return "download"
+
+
+def set_user_mode(user_id: int, mode: str) -> None:
+    """Set active mode for a user ('download' or 'bypass')."""
+    try:
+        with get_db() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                INSERT INTO user_modes (user_id, mode, updated_at)
+                VALUES (?, ?, CURRENT_TIMESTAMP)
+                ON CONFLICT(user_id) DO UPDATE SET
+                    mode = excluded.mode,
+                    updated_at = CURRENT_TIMESTAMP
+                """,
+                (user_id, mode),
+            )
+            conn.commit()
+    except Exception as e:
+        logger.error("Failed to set user mode for %s to %s: %s", user_id, mode, e)
+
+
+async def get_user_mode_async(user_id: int) -> str:
+    """Async wrapper to get user mode."""
+    import asyncio
+    return await asyncio.to_thread(get_user_mode, user_id)
+
+
+async def set_user_mode_async(user_id: int, mode: str) -> None:
+    """Async wrapper to set user mode."""
+    import asyncio
+    await asyncio.to_thread(set_user_mode, user_id, mode)

@@ -7,3 +7,6 @@ __pycache__/
 .git/
 *cookies.txt
 cookies*
+*.session
+*.session-journal
+bot.session
