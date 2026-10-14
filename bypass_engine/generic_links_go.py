@@ -15,7 +15,7 @@ from bs4 import BeautifulSoup
 import aiohttp
 
 from .registry import SiteEntry
-from .ssrf import is_safe_url, sanitize_url
+from .ssrf import is_safe_url_async, sanitize_url
 
 logger = logging.getLogger(__name__)
 
@@ -59,7 +59,7 @@ async def bypass_generic_links_go(
         (final_url, None) on success
         (None, error_message) on failure
     """
-    safe, reason = is_safe_url(url)
+    safe, reason = await is_safe_url_async(url)
     if not safe:
         return None, reason
 
@@ -69,7 +69,7 @@ async def bypass_generic_links_go(
     api_base = site.api_domain if (site and site.api_domain) else base_domain
     post_url = urljoin(api_base, "/links/go")
 
-    safe_post, post_reason = is_safe_url(post_url)
+    safe_post, post_reason = await is_safe_url_async(post_url)
     if not safe_post:
         return None, post_reason
 

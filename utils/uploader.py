@@ -33,18 +33,32 @@ async def get_telethon_client() -> Optional[TelegramClient]:
     """
     Get or initialize the shared Telethon TelegramClient session.
     Uses bot_token for authentication, enabling bot uploads up to 2GB.
+    F16 FIX: Reconnects automatically if the MTProto session dropped.
     """
     global _telethon_client
 
     if not is_telethon_configured():
         return None
 
+    # Fast path: already connected
     if _telethon_client is not None and _telethon_client.is_connected():
         return _telethon_client
 
     async with _client_lock:
+        # Re-check under lock
         if _telethon_client is not None and _telethon_client.is_connected():
             return _telethon_client
+
+        # F16 FIX: If client exists but disconnected, try reconnecting first
+        if _telethon_client is not None and not _telethon_client.is_connected():
+            try:
+                await _telethon_client.connect()
+                if _telethon_client.is_connected():
+                    logger.info("Telethon MTProto client reconnected successfully.")
+                    return _telethon_client
+            except Exception as e:
+                logger.warning("Telethon reconnect failed (%s). Re-initializing client.", e)
+                _telethon_client = None
 
         try:
             api_id = int(os.getenv("API_ID"))
@@ -60,6 +74,7 @@ async def get_telethon_client() -> Optional[TelegramClient]:
         except Exception as e:
             logger.error("Failed to initialize Telethon MTProto client: %s", e)
             return None
+
 
 
 async def send_video_via_telethon(

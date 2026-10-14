@@ -38,7 +38,10 @@ from utils.downloader import (
     classify_error,
 )
 from utils.helpers import is_valid_url, truncate, human_size, progress_bar
-from utils.db import add_or_update_user, increment_download_count
+from utils.db import (
+    add_or_update_user_async,
+    increment_download_count_async,
+)
 from handlers.admin import check_user_subscription, get_force_sub_channel
 from utils.uploader import (
     send_video_via_telethon,
@@ -56,10 +59,14 @@ def _encode_cb(action: str, extra: str = "") -> str:
 
 
 def _decode_cb(data: str) -> dict:
+    """F25 FIX: Decode callback data with fallback for plain text strings."""
     try:
-        return json.loads(data)
+        res = json.loads(data)
+        if isinstance(res, dict):
+            return res
+        return {"a": str(res), "e": ""}
     except Exception:
-        return {}
+        return {"a": str(data), "e": ""}
 
 
 def _h(text: str) -> str:
@@ -122,12 +129,17 @@ async def _progress_updater(bot, chat_id: int, msg_id: int, progress_state: dict
 # ── Global error handler ─────────────────────────────────────────────────────
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Log all errors and notify user in Telegram."""
+    """Log all errors and notify user in Telegram safely."""
     logger.error("Exception while handling update:", exc_info=context.error)
+
+    # F13 FIX: Sanitize user-facing error message to avoid internal disclosure
+    raw_msg = str(context.error) if context.error else "Unknown error"
+    first_line = raw_msg.splitlines()[0] if raw_msg else "Unknown error"
+    safe_err = _h(first_line[:120])
 
     err_text = (
         "⚠️ <b>An error occurred while processing your request.</b>\n\n"
-        f"<code>{_h(str(context.error))}</code>\n\n"
+        f"<code>{safe_err}</code>\n\n"
         "Please try again or send a different link."
     )
 
@@ -148,8 +160,9 @@ async def url_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     chat_id = update.effective_chat.id
     text = update.message.text.strip()
 
-    # Track user in database
-    add_or_update_user(user.id, user.username, user.first_name)
+    # Track user in database (F04: async non-blocking call)
+    await add_or_update_user_async(user.id, user.username, user.first_name)
+
 
     # 1. Force-subscribe check
     if not await check_user_subscription(user.id, context.bot):
@@ -309,7 +322,7 @@ async def _send_video_message(
     Automatically routes files > 50MB through Telethon MTProto client (up to 2GB).
     """
     size = file_size_mb(file_path)
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     meta = await loop.run_in_executor(None, get_video_metadata_and_thumb, file_path)
     thumb_path = meta.get("thumbnail_path")
 
@@ -377,7 +390,7 @@ async def _execute_photo_download(
     await context.bot.send_chat_action(chat_id, ChatAction.UPLOAD_PHOTO)
 
     photo_url = info.get("photo_url")
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     file_path = await loop.run_in_executor(None, download_photo, photo_url)
 
     if not file_path or not os.path.isfile(file_path):
@@ -406,7 +419,8 @@ async def _execute_photo_download(
                 read_timeout=120,
                 write_timeout=120,
             )
-        increment_download_count(update.effective_user.id)
+        await increment_download_count_async(update.effective_user.id)
+
         try:
             await msg.delete()
         except TelegramError:
@@ -442,7 +456,7 @@ async def _execute_carousel_download(
     )
     await context.bot.send_chat_action(chat_id, ChatAction.UPLOAD_PHOTO)
 
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     items, raw_info = await loop.run_in_executor(None, download_carousel_media, url)
 
     if not items:
@@ -521,7 +535,7 @@ async def _execute_carousel_download(
                         except Exception:
                             pass
 
-        increment_download_count(update.effective_user.id)
+        await increment_download_count_async(update.effective_user.id)
         try:
             await msg.delete()
         except TelegramError:
@@ -570,6 +584,13 @@ async def _execute_fast_reel_download(update: Update, context: ContextTypes.DEFA
         await msg.edit_text(f"⚠️ File is too large ({size:.1f} MB). Max allowed is {MAX_FILE_SIZE_MB} MB.", parse_mode="HTML")
         cleanup_session(file_path)
         return
+    elif size > 50 and not is_telethon_configured():
+        await msg.edit_text(
+            f"⚠️ Video is {size:.1f} MB. Telegram Bot API limit is 50 MB, and Telethon MTProto client is not configured.",
+            parse_mode="HTML",
+        )
+        cleanup_session(file_path)
+        return
 
     # Fetch basic info for clean caption
     try:
@@ -591,7 +612,7 @@ async def _execute_fast_reel_download(update: Update, context: ContextTypes.DEFA
     await context.bot.send_chat_action(chat_id, ChatAction.UPLOAD_VIDEO)
     try:
         await _send_video_message(context.bot, chat_id, file_path, caption)
-        increment_download_count(update.effective_user.id)
+        await increment_download_count_async(update.effective_user.id)
         # Delete progress message cleanly
         try:
             await msg.delete()
@@ -602,6 +623,7 @@ async def _execute_fast_reel_download(update: Update, context: ContextTypes.DEFA
         await context.bot.send_message(chat_id, f"❌ Failed to send video: {_h(str(e))}", parse_mode="HTML")
     finally:
         cleanup_session(file_path)
+
 
 
 # ── 📦 Sequential Batch Downloader ──────────────────────────────────────────
@@ -615,7 +637,7 @@ async def _execute_batch_download(
     chat_id = update.effective_chat.id
     user_id = update.effective_user.id
     total = len(urls)
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
 
     status_msg = await update.message.reply_text(
         f"📋 <b>Batch Download: {total} links detected!</b>\n\n"
@@ -724,7 +746,7 @@ async def _execute_batch_download(
                                     pass
 
                 success_count += 1
-                increment_download_count(user_id)
+                await increment_download_count_async(user_id)
             except Exception as e:
                 logger.error("Batch carousel send error: %s", e)
                 fail_count += 1
@@ -757,7 +779,7 @@ async def _execute_batch_download(
                 with open(file_path, "rb") as f:
                     await context.bot.send_photo(chat_id=chat_id, photo=f, caption=caption, read_timeout=120, write_timeout=120)
                 success_count += 1
-                increment_download_count(user_id)
+                await increment_download_count_async(user_id)
             except Exception as e:
                 logger.error("Batch photo send error: %s", e)
                 fail_count += 1
@@ -788,7 +810,7 @@ async def _execute_batch_download(
                         if thumb_f:
                             thumb_f.close()
                 success_count += 1
-                increment_download_count(user_id)
+                await increment_download_count_async(user_id)
             except Exception as e:
                 logger.error("Batch audio send error: %s", e)
                 fail_count += 1
@@ -824,7 +846,7 @@ async def _execute_batch_download(
         try:
             await _send_video_message(context.bot, chat_id, target_path, caption)
             success_count += 1
-            increment_download_count(user_id)
+            await increment_download_count_async(user_id)
         except Exception as e:
             logger.error("Batch video send error: %s", e)
             fail_count += 1
@@ -912,7 +934,7 @@ async def _execute_trim_download(
     await context.bot.send_chat_action(chat_id, ChatAction.UPLOAD_VIDEO)
     try:
         await _send_video_message(context.bot, chat_id, target_path, caption)
-        increment_download_count(update.effective_user.id)
+        await increment_download_count_async(update.effective_user.id)
         try:
             await status_msg.delete()
         except TelegramError:
@@ -975,7 +997,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         )
         await context.bot.send_chat_action(chat_id, ChatAction.UPLOAD_VIDEO)
 
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         compressed_path = await loop.run_in_executor(None, compress_video_to_size, file_path, 46.0)
 
         target = compressed_path if compressed_path and os.path.isfile(compressed_path) else file_path
@@ -1000,7 +1022,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
         try:
             await _send_video_message(context.bot, chat_id, target, caption)
-            increment_download_count(query.from_user.id)
+            await increment_download_count_async(query.from_user.id)
             try:
                 await query.delete_message()
             except Exception:
@@ -1028,7 +1050,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         )
         await context.bot.send_chat_action(chat_id, ChatAction.UPLOAD_VIDEO)
 
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         parts = await loop.run_in_executor(None, split_video_by_size, file_path, 46.0)
 
         if not parts:
@@ -1061,7 +1083,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             except Exception as e:
                 logger.error("Failed to send part %s: %s", part_num, e)
 
-        increment_download_count(query.from_user.id)
+        await increment_download_count_async(query.from_user.id)
         try:
             await query.delete_message()
         except Exception:
@@ -1134,8 +1156,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         size = file_size_mb(file_path)
         if size > MAX_FILE_SIZE_MB:
             await query.edit_message_text(
-                f"⚠️ <b>Video size is {size:.1f} MB (Exceeds Telegram 2 GB limit)</b>\n\n"
-                f"Telegram maximum allowed upload size is {MAX_FILE_SIZE_MB} MB (2 GB).",
+                f"⚠️ <b>Video size is {size:.1f} MB (Exceeds {MAX_FILE_SIZE_MB} MB limit)</b>\n\n"
+                f"Telegram maximum allowed upload size is {MAX_FILE_SIZE_MB} MB.",
                 parse_mode="HTML",
             )
             cleanup_session(file_path)
@@ -1184,7 +1206,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await context.bot.send_chat_action(chat_id, ChatAction.UPLOAD_VIDEO)
         try:
             await _send_video_message(context.bot, chat_id, file_path, caption)
-            increment_download_count(query.from_user.id)
+            await increment_download_count_async(query.from_user.id)
             try:
                 await context.bot.delete_message(chat_id=chat_id, message_id=query.message.message_id)
             except TelegramError:
@@ -1296,7 +1318,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                         if thumb_file:
                             thumb_file.close()
 
-            increment_download_count(query.from_user.id)
+            await increment_download_count_async(query.from_user.id)
             try:
                 await context.bot.delete_message(chat_id=chat_id, message_id=query.message.message_id)
             except TelegramError:

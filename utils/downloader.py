@@ -17,17 +17,28 @@ from typing import Optional, Tuple
 
 import requests
 import yt_dlp
+import shutil
+from collections import OrderedDict
 from PIL import Image
+
+from bypass_engine.ssrf import is_safe_url
 
 logger = logging.getLogger(__name__)
 
 DOWNLOAD_DIR = os.getenv("DOWNLOAD_DIR", "downloads")
 MAX_FILE_SIZE_MB = int(os.getenv("MAX_FILE_SIZE_MB", "50"))
 MAX_FILE_SIZE_BYTES = MAX_FILE_SIZE_MB * 1024 * 1024
-FFMPEG_PATH = os.getenv(
-    "FFMPEG_PATH",
-    r"C:\Users\Lenovo\AppData\Local\Microsoft\WinGet\Packages\yt-dlp.FFmpeg_Microsoft.Winget.Source_8wekyb3d8bbwe\ffmpeg-N-125875-g5d4d3bdc61-win64-gpl\bin\ffmpeg.exe",
+
+# F03 FIX: Dynamically detect ffmpeg from PATH or fall back to platform default
+_default_ffmpeg = (
+    shutil.which("ffmpeg")
+    or (
+        r"C:\Users\Lenovo\AppData\Local\Microsoft\WinGet\Packages\yt-dlp.FFmpeg_Microsoft.Winget.Source_8wekyb3d8bbwe\ffmpeg-N-125875-g5d4d3bdc61-win64-gpl\bin\ffmpeg.exe"
+        if os.name == "nt"
+        else "ffmpeg"
+    )
 )
+FFMPEG_PATH = os.getenv("FFMPEG_PATH") or _default_ffmpeg
 
 
 # ── Platform detection ──────────────────────────────────────────────────────
@@ -70,20 +81,26 @@ URL_REGEX = re.compile(
 
 
 def resolve_short_url(url: str) -> str:
-    """Follow redirects for short URLs like pin.it, bit.ly, etc."""
+    """F07 FIX: Follow redirects for short URLs like pin.it, bit.ly, etc., validating SSRF safety."""
     u = url.lower()
     if any(k in u for k in ("pin.it", "t.co", "bit.ly", "tinyurl", "fb.watch")):
         try:
+            safe, _ = is_safe_url(url)
+            if not safe:
+                return url
             headers = {
                 "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
                 "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
             }
             r = requests.get(url, headers=headers, allow_redirects=True, timeout=12)
             if r.url:
-                return r.url
+                safe_target, _ = is_safe_url(r.url)
+                if safe_target:
+                    return r.url
         except Exception as e:
             logger.warning("Could not resolve short url %s: %s", url, e)
     return url
+
 
 
 def _download_direct_file(url: str, output_path: str, referer: Optional[str] = None) -> bool:
@@ -496,12 +513,17 @@ def _make_session_dir() -> str:
     return path
 
 
+import threading
+_cookie_write_lock = threading.Lock()
+
+
 def get_cookie_file_path() -> Optional[str]:
     """
     Checks if cookies are provided via:
     1. A physical file named 'cookies.txt'
     2. Environment variables: 'INSTAGRAM_COOKIES', 'YOUTUBE_COOKIES', or 'COOKIES' (raw text or base64)
     Returns path to the cookie file or None.
+    F18 FIX: Thread-safe cookie writing.
     """
     if os.path.isfile("cookies.txt") and os.path.getsize("cookies.txt") > 10:
         return "cookies.txt"
@@ -521,8 +543,10 @@ def get_cookie_file_path() -> Optional[str]:
                     env_cookies = decoded
             except Exception:
                 pass
-            with open(cookie_path, "w", encoding="utf-8") as f:
-                f.write(env_cookies)
+            with _cookie_write_lock:
+                if not os.path.isfile(cookie_path) or os.path.getsize(cookie_path) == 0:
+                    with open(cookie_path, "w", encoding="utf-8") as f:
+                        f.write(env_cookies)
             return cookie_path
         except Exception as e:
             logger.warning("Could not write session cookies: %s", e)
@@ -538,11 +562,24 @@ def normalize_youtube_url(url: str) -> str:
     return url
 
 
-_last_media_errors: dict[str, str] = {}
+# F10 FIX: Bounded LRU cache dict to prevent unbounded memory growth from failed URLs
+class BoundedDict(OrderedDict):
+    def __init__(self, maxsize=500, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.maxsize = maxsize
+
+    def __setitem__(self, key, value):
+        if len(self) >= self.maxsize:
+            self.popitem(last=False)
+        super().__setitem__(key, value)
+
+
+_last_media_errors: BoundedDict = BoundedDict(maxsize=500)
 
 
 def get_last_media_error(url: str) -> Optional[str]:
     return _last_media_errors.get(url)
+
 
 
 def classify_error(e: Exception, url: str) -> str:
@@ -833,8 +870,9 @@ def _download_file(url: str, ydl_opts: dict, progress_state: Optional[dict] = No
 
 async def get_media_info(url: str) -> Optional[dict]:
     """Return cleaned metadata dict for display."""
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     info = await loop.run_in_executor(None, _get_info, url)
+
     if not info:
         return None
 
@@ -935,7 +973,9 @@ def download_carousel_media(url: str) -> Tuple[list[dict], dict]:
         info = extract_with_gallery_dl(url)
 
     if not info:
+        cleanup_session(out_dir)
         return [], {}
+
 
     raw_entries = info.get("entries")
     if raw_entries:
@@ -1027,7 +1067,13 @@ def download_carousel_media(url: str) -> Tuple[list[dict], dict]:
                     "path": target_path,
                 })
 
+    if not items:
+        cleanup_session(out_dir)
+        return [], {}
+
     return items, info
+
+
 
 
 async def download_video(
@@ -1057,7 +1103,7 @@ async def download_video(
     if platform == "tiktok":
         opts["format"] = "download_addr-0/bestvideo+bestaudio/best"
 
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     return await loop.run_in_executor(None, _download_file, url, opts, progress_state)
 
 
@@ -1086,8 +1132,9 @@ async def download_audio(
             ],
         }
     )
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     return await loop.run_in_executor(None, _download_file, url, opts, progress_state)
+
 
 
 def file_size_mb(path: str) -> float:
@@ -1098,14 +1145,20 @@ def file_size_mb(path: str) -> float:
 
 
 def cleanup_session(path: str) -> None:
-    """Remove the session download folder."""
+    """Remove the session download folder (handles either directory path or file path inside)."""
     try:
-        folder = str(Path(path).parent)
-        for f in Path(folder).iterdir():
-            f.unlink(missing_ok=True)
-        Path(folder).rmdir()
+        p = Path(path)
+        folder = p if p.is_dir() else p.parent
+        if folder.is_dir():
+            for f in folder.iterdir():
+                if f.is_file():
+                    f.unlink(missing_ok=True)
+                elif f.is_dir():
+                    shutil.rmtree(f, ignore_errors=True)
+            folder.rmdir()
     except Exception as e:
-        logger.warning("Cleanup failed: %s", e)
+        logger.warning("Cleanup failed for %s: %s", path, e)
+
 
 
 def get_media_duration(file_path: str) -> float:

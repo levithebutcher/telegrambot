@@ -32,9 +32,21 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# ── F01 FIX: Silence httpx & telegram HTTP loggers ──────────────────────────
+# httpx logs every request URL at INFO level, and those URLs contain the full
+# BOT_TOKEN (e.g. /bot<token>/getUpdates). Without this, the token is written
+# to bot.log hundreds of times per session.
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("telegram.ext.ExtBot").setLevel(logging.WARNING)
+logging.getLogger("telegram.bot").setLevel(logging.WARNING)
+# ─────────────────────────────────────────────────────────────────────────────
 
 import threading
+import asyncio
+import aiohttp
 from http.server import HTTPServer, BaseHTTPRequestHandler
+from telegram.ext import ContextTypes
+
 
 class HealthCheckHandler(BaseHTTPRequestHandler):
     def do_GET(self):
@@ -57,23 +69,24 @@ def start_health_server():
         logger.warning(f"Health server error on port {port}: {e}")
 
 
-def self_ping_worker():
-    """Periodically ping RENDER_EXTERNAL_URL every 10 minutes to keep Render awake."""
-    import time
-    import urllib.request
+# ── F20 FIX: Self-ping as async PTB job (no daemon-thread pile-up) ──────────
+async def _self_ping_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """PTB job_queue repeating job: pings RENDER_EXTERNAL_URL every 10 min."""
     url = os.getenv("RENDER_EXTERNAL_URL")
     if not url:
         return
-    logger.info(f"🔄 Self-ping keep-alive worker started for {url}")
-    while True:
-        time.sleep(10 * 60)  # 10 minutes
-        try:
-            req = urllib.request.Request(url, headers={"User-Agent": "RenderSelfPing/1.0"})
-            with urllib.request.urlopen(req, timeout=15) as resp:
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                url,
+                headers={"User-Agent": "RenderSelfPing/1.0"},
+                timeout=aiohttp.ClientTimeout(total=15),
+            ) as resp:
                 pass
-            logger.info("Keep-alive self-ping sent to %s", url)
-        except Exception as e:
-            logger.warning("Keep-alive self-ping failed: %s", e)
+        logger.info("Keep-alive ping sent to %s", url)
+    except Exception as e:
+        logger.warning("Keep-alive ping failed: %s", e)
+# ─────────────────────────────────────────────────────────────────────────────
 
 
 def main() -> None:
@@ -82,9 +95,8 @@ def main() -> None:
         logger.error("❌ BOT_TOKEN not set! Please create a .env file with your bot token.")
         raise SystemExit(1)
 
-    # Start health server and keep-alive ping for Render
+    # Start health server in daemon thread
     threading.Thread(target=start_health_server, daemon=True).start()
-    threading.Thread(target=self_ping_worker, daemon=True).start()
 
     # Initialize SQLite database
     init_db()
@@ -133,6 +145,15 @@ def main() -> None:
 
     # Register global error handler
     app.add_error_handler(error_handler)
+
+    # Schedule self-ping keep-alive as async job (F20 fix)
+    if os.getenv("RENDER_EXTERNAL_URL"):
+        app.job_queue.run_repeating(
+            callback=_self_ping_job,
+            interval=600,  # 10 minutes
+            first=60,      # first ping after 1 minute
+        )
+        logger.info("🔄 Self-ping keep-alive job scheduled via job_queue.")
 
     logger.info("🤖 Universal Downloader Bot is starting...")
     app.run_polling(bootstrap_retries=5)

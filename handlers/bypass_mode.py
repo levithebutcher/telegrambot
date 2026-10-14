@@ -10,8 +10,9 @@ from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ContextTypes
 
 from utils.downloader import extract_urls
-from utils.db import add_or_update_user
+from utils.db import add_or_update_user_async
 from handlers.admin import check_user_subscription, get_force_sub_channel
+from handlers.downloader import _encode_cb
 from bypass_engine import bypass, sanitize_url
 
 logger = logging.getLogger(__name__)
@@ -43,7 +44,7 @@ async def bypass_mode_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
     if not user or not update.message or not update.message.text:
         return
 
-    add_or_update_user(user.id, user.username, user.first_name)
+    await add_or_update_user_async(user.id, user.username, user.first_name)
 
     # Force-subscribe check
     if not await check_user_subscription(user.id, context.bot):
@@ -51,8 +52,9 @@ async def bypass_mode_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
         clean_ch = channel.lstrip("@")
         kb = [
             [InlineKeyboardButton("📢 Join Channel", url=f"https://t.me/{clean_ch}")],
-            [InlineKeyboardButton("✅ Joined / Verify", callback_data="verify_sub")],
+            [InlineKeyboardButton("✅ Joined / Verify", callback_data=_encode_cb("verify_sub"))],
         ]
+
         await update.message.reply_text(
             "🔒 <b>Channel Membership Required</b>\n\n"
             "Bot use karne ke liye pehle hamara official channel join karein:\n"

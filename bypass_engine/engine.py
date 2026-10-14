@@ -14,12 +14,22 @@ from collections import defaultdict
 from .registry import find_site
 from .generic_links_go import bypass_generic_links_go
 from .expand import expand_redirects
-from .ssrf import is_safe_url, sanitize_url
+from .ssrf import is_safe_url_async, sanitize_url
+
 
 logger = logging.getLogger(__name__)
 
-# Global semaphore: max 5 concurrent bypass tasks
-GLOBAL_SEMAPHORE = asyncio.Semaphore(5)
+# Global semaphore: max 5 concurrent bypass tasks.
+# F11 FIX: Lazy-initialized so it is created inside a running event loop.
+_GLOBAL_SEMAPHORE: Optional[asyncio.Semaphore] = None
+
+
+def _get_semaphore() -> asyncio.Semaphore:
+    """Return the global bypass semaphore, creating it lazily if needed."""
+    global _GLOBAL_SEMAPHORE
+    if _GLOBAL_SEMAPHORE is None:
+        _GLOBAL_SEMAPHORE = asyncio.Semaphore(5)
+    return _GLOBAL_SEMAPHORE
 
 # Per-user rate limiting: max 10 requests per 60 seconds
 USER_RATE_LIMIT = 10
@@ -42,20 +52,22 @@ def check_rate_limit(user_id: int) -> Tuple[bool, Optional[str]]:
     now = time.time()
     cutoff = now - RATE_WINDOW_SECONDS
     history = _user_request_history[user_id]
-    
+
     # Filter out requests older than window
-    _user_request_history[user_id] = [t for t in history if t > cutoff]
-    
-    if len(_user_request_history[user_id]) >= USER_RATE_LIMIT:
+    fresh = [t for t in history if t > cutoff]
+
+    if len(fresh) >= USER_RATE_LIMIT:
+        _user_request_history[user_id] = fresh
         return False, "Rate limit exceed ho gaya hai (max 10 link per minute). Kuch der baad try karein."
-    
-    _user_request_history[user_id].append(now)
+
+    fresh.append(now)
+    _user_request_history[user_id] = fresh
     return True, None
 
 
 async def _resolve_single_url(url: str, total_timeout: float = 30.0) -> BypassResult:
     """Internal resolver handling nested shorteners up to 3 levels."""
-    safe, reason = is_safe_url(url)
+    safe, reason = await is_safe_url_async(url)
     if not safe:
         return BypassResult(
             original_url=url,
@@ -183,7 +195,7 @@ async def bypass(url: str, user_id: Optional[int] = None, timeout: float = 30.0)
                 error=err_msg,
             )
 
-    async with GLOBAL_SEMAPHORE:
+    async with _get_semaphore():
         try:
             return await asyncio.wait_for(_resolve_single_url(url, total_timeout=timeout), timeout=timeout)
         except asyncio.TimeoutError:

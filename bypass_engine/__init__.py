@@ -4,7 +4,7 @@ Bypass Engine package for URL shortener bypassing, redirection expansion, and se
 
 from .engine import bypass, BypassResult
 from .registry import SITES, SiteEntry, find_site
-from .ssrf import is_safe_url, sanitize_url
+from .ssrf import is_safe_url, is_safe_url_async, sanitize_url
 
 __all__ = [
     "bypass",
@@ -13,5 +13,7 @@ __all__ = [
     "SiteEntry",
     "find_site",
     "is_safe_url",
+    "is_safe_url_async",
     "sanitize_url",
 ]
+

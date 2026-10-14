@@ -8,7 +8,7 @@ from typing import Optional, Tuple
 from urllib.parse import urljoin
 import httpx
 
-from .ssrf import is_safe_url, sanitize_url
+from .ssrf import is_safe_url_async, sanitize_url
 
 logger = logging.getLogger(__name__)
 
@@ -51,7 +51,7 @@ async def expand_redirects(
         ) as client:
             while hops < max_hops:
                 # SSRF check before requesting
-                safe, reason = is_safe_url(current_url)
+                safe, reason = await is_safe_url_async(current_url)
                 if not safe:
                     return current_url, hops, reason
 
@@ -84,9 +84,10 @@ async def expand_redirects(
                     next_url = urljoin(current_url, location)
 
                     # Validate SSRF on next hop
-                    safe_next, next_reason = is_safe_url(next_url)
+                    safe_next, next_reason = await is_safe_url_async(next_url)
                     if not safe_next:
                         return current_url, hops, next_reason
+
 
                     if next_url in visited:
                         logger.warning("Redirect loop detected at %s", sanitize_url(next_url))

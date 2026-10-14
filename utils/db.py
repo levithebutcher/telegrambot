@@ -194,3 +194,18 @@ async def set_user_mode_async(user_id: int, mode: str) -> None:
     """Async wrapper to set user mode."""
     import asyncio
     await asyncio.to_thread(set_user_mode, user_id, mode)
+
+
+async def add_or_update_user_async(
+    user_id: int, username: Optional[str], first_name: Optional[str]
+) -> None:
+    """Async wrapper for add_or_update_user — use in async handlers to avoid blocking the event loop."""
+    import asyncio
+    await asyncio.to_thread(add_or_update_user, user_id, username, first_name)
+
+
+async def increment_download_count_async(user_id: int) -> None:
+    """Async wrapper for increment_download_count — use in async handlers to avoid blocking the event loop."""
+    import asyncio
+    await asyncio.to_thread(increment_download_count, user_id)
+
